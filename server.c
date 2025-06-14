@@ -1,10 +1,34 @@
 
 //超时队列和session需要放前面
+#include <mysql/mysql.h>
+#include <limits.h>
+//1.3超时队列
+#define TIME_SLICE 30      // 超时时间轮长度，比如30s
+#define MAX_FD 1024       // 支持的最大netfd/net_fd数（可按需调整）
+
+
+typedef struct slot_node {
+    int netfd;// 可用作fd或唯一id
+    struct slot_node* next;
+} slot_node_t;
+
+typedef struct slot_list {
+    slot_node_t* head;
+    slot_node_t* tail;
+    int size;
+} slot_list_t;
 typedef struct timeout_wheel {
     int timer;                  // 当前时间槽指针
     slot_list_t slots[TIME_SLICE]; // 时间轮
     int index[MAX_FD];         // netfd所在slot下标
 } timeout_wheel_t;
+
+
+
+void timeout_wheel_init(timeout_wheel_t* wheel);
+void _remove_usr_from_slot(slot_list_t* slot, int netfd);
+void timeout_wheel_touch(timeout_wheel_t* wheel, int netfd);
+void timeout_wheel_tick(timeout_wheel_t* wheel, void (*on_timeout)(int netfd));
 
 typedef struct Session_s {
     int netfd;
@@ -94,7 +118,7 @@ void handler(int sig);
 void sig_handler1(int);
 void sig_handler2(int);
 
-#include <mysql/mysql.h>
+
 
 typedef struct {
     int listen_fd;
@@ -137,28 +161,7 @@ int session_clean(server_context_t* ctx,int netfd);
 int tcpInit(const char* filename);
 
 
-//1.3超时队列
-#define TIME_SLICE 30      // 超时时间轮长度，比如30s
-#define MAX_FD 1024       // 支持的最大netfd/net_fd数（可按需调整）
 
-
-typedef struct slot_node {
-    int netfd;// 可用作fd或唯一id
-    struct slot_node* next;
-} slot_node_t;
-
-typedef struct slot_list {
-    slot_node_t* head;
-    slot_node_t* tail;
-    int size;
-} slot_list_t;
-
-
-
-void timeout_wheel_init(timeout_wheel_t* wheel);
-void _remove_usr_from_slot(slot_list_t* slot, int netfd);
-void timeout_wheel_touch(timeout_wheel_t* wheel, int netfd);
-void timeout_wheel_tick(timeout_wheel_t* wheel, void (*on_timeout)(int netfd));
 
 
 
@@ -465,33 +468,35 @@ int main() {
     while (1) {
         //====时间轮tick：每秒tick一次，批量处理超时===
         time_t now = time(NULL);
+        static time_t last_tick = 0; // 修正未定义的变量 last_tick
         if (now != last_tick) {
             last_tick = now;
-            timeout_wheel_tick(&timeout_wheel, close_fd_on_timeout); // 超时用户的资源清理：close_fd_on_timeout内关闭fd、移除epoll等
+            timeout_wheel_tick(&ctx.timeout_wheel, close_fd_on_timeout); // 修正超时轮引用
         }
 
-        int readyNum = epoll_wait(epfd, readyArr, WORKER_NUM + 4, 100);
+        struct epoll_event readyArr[WORKER_NUM + 4]; // 修正未定义的 readyArr
+        int readyNum = epoll_wait(ctx.epfd, readyArr, WORKER_NUM + 4, 100);
         if (readyNum == 0) {
             // 时间轮tick统一处理超时，无就绪也无所谓
             continue;
         }
         for (int i = 0; i < readyNum; ++i) {
             int fd = readyArr[i].data.fd;
-            if (fd == listen_fd) {
-                int netfd = accept(listen_fd, NULL, NULL);
+            if (fd == ctx.listen_fd) {
+                int netfd = accept(ctx.listen_fd, NULL, NULL);
                 ERROR_CHECK(netfd, -1, "accept");
-                
+
                 // 新连接加入监听和时间轮，开始计时
-                epoll_add(epfd, netfd);
-                timeout_wheel_touch(&timeout_wheel, netfd);
-                
+                epoll_add(ctx.epfd, netfd);
+                timeout_wheel_touch(&ctx.timeout_wheel, netfd);
+
             }
-            else if (fd == exitPipe[0]) {
+            else if (fd == ctx.exitPipe[0]) {
                 //退出唤醒所有线程优雅退出
-                threadPool.exitFlag = 1;
-                pthread_cond_broadcast(&threadPool.taskQueue.cond);
-                for (int j = 0; j < threadPool.threadNum; ++j) {
-                    pthread_join(threadPool.tidArr.tids[j], NULL);
+                ctx.threadPool.exitFlag = 1;
+                pthread_cond_broadcast(&ctx.threadPool.taskQueue.cond);
+                for (int j = 0; j < ctx.threadPool.threadNum; ++j) {
+                    pthread_join(ctx.threadPool.threads[j], NULL); // 修正线程数组引用
                 }
                 pthread_exit(NULL);
             }
@@ -499,38 +504,67 @@ int main() {
                 // 只负责主线程命令和上传/下载分发
                 tlv_t* tlv = tlv_recv(fd);
                 if (!tlv) {
-                    epoll_del(epfd, fd);
+                    epoll_del(ctx.epfd, fd);
                     close(fd);
                     // 断开连接时无需手动从时间轮删除，tick时会自动清理
                     continue;
                 }
                 // 每收到一次客户端请求包，都刷新fd的超时时间
-                timeout_wheel_touch(&timeout_wheel, fd);
+                timeout_wheel_touch(&ctx.timeout_wheel, fd);
 
-                // 仅长命令（2*）进入线程池，其它主线程直接处理
                 if (tlv->type / 16 == 2) { // 上传/下载
-
-                    //上传或下载的预处理
-                    pthread_mutex_lock(&threadPool.taskQueue.mutex);
-                    enQueue(&threadPool.taskQueue, fd); // 只放fd，后续数据由子线程收
-                    pthread_cond_signal(&threadPool.taskQueue.cond);
-                    pthread_mutex_unlock(&threadPool.taskQueue.mutex);
-                    tlv_free(tlv); // 入队后释放
+                    if (tlv->type == CMD_UPLOAD) {
+                        // 上传任务，启动一个线程
+                        pthread_t upload_thread;
+                        task_param_t task_param;
+                        task_param.upload.netfd = fd;
+                        strcpy(task_param.upload.filename, tlv->value); // 使用 TLV 数据
+                        pthread_create(&upload_thread, NULL, handle_upload, &task_param);
+                        pthread_detach(upload_thread);
+                    }
+                    else if (tlv->type == CMD_DOWNLOAD) {
+                        size_t file_size = get_file_size(tlv->value); // 获取文件大小
+                        if (file_size <= 100 * 1024 * 1024) { // 小文件
+                            pthread_t download_thread;
+                            task_param_t task_param;
+                            task_param.download_small.netfd = fd;
+                            strcpy(task_param.download_small.filename, tlv->value);
+                            pthread_create(&download_thread, NULL, handle_download_small, &task_param);
+                            pthread_detach(download_thread);
+                        }
+                        else { // 大文件，按100MB分片
+                            size_t offset = 0;
+                            unsigned int chunk_index = 0;
+                            unsigned int chunk_count = (file_size + 100 * 1024 * 1024 - 1) / (100 * 1024 * 1024);
+                            while (offset < file_size) {
+                                size_t chunk_size = (file_size - offset > 100 * 1024 * 1024) ? 100 * 1024 * 1024 : file_size - offset;
+                                pthread_t download_thread;
+                                task_param_t task_param;
+                                task_param.download_large.netfd = fd;
+                                strcpy(task_param.download_large.filename, tlv->value);
+                                task_param.download_large.offset = offset;
+                                task_param.download_large.size = chunk_size;
+                                task_param.download_large.chunk_index = chunk_index;
+                                task_param.download_large.chunk_count = chunk_count;
+                                pthread_create(&download_thread, NULL, handle_download_large, &task_param);
+                                pthread_detach(download_thread);
+                                offset += chunk_size;
+                                chunk_index++;
+                            }
+                        }
+                    }
+                    tlv_free(tlv); // 释放tlv资源
                 }
                 else {
                     // 其它命令直接主线程分发
-                    //mysql的连接可能需要调用sql,新用户需要申请sql
-
-                    handle_packet(tlv, fd, conn);
+                    handle_packet(&ctx.session[fd], tlv); // 修正 handle_packet 调用
                     free(tlv);
-                    // handle_packet内负责tlv_free
                 }
             }
         }
     }
     return 0;
 }
-
 
 
 
@@ -642,76 +676,6 @@ void handler(int sig) {
     printf("收到信号 %d , 退出中...\n", sig);
 }
 
-// 主函数
-int main(int argc, char* argv[]) {
-    if (argc != 4) {
-        printf("Usage: %s <IP> <Port> <WorkerNum>\n", argv[0]);
-        return -1;
-    }
-
-    int exitPipe[2];
-    pipe(exitPipe);
-    if (fork()) {
-        // 父进程
-        close(exitPipe[0]);
-        signal(SIGUSR1, handler);
-        wait(NULL);
-        printf("Parent is going to exit!\n");
-        exit(0);
-    }
-
-    // 子进程
-    close(exitPipe[1]);
-
-    thread_pool_t threadPool;
-    int workerNum = atoi(argv[3]);
-    threadPoolInit(&threadPool, workerNum);
-
-    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd == -1) {
-        perror("Socket creation failed");
-        exit(1);
-    }
-    struct sockaddr_in addr;
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(atoi(argv[2]));
-    addr.sin_addr.s_addr = inet_addr(argv[1]);
-
-    if (bind(sockfd, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
-        perror("Bind failed");
-        exit(1);
-    }
-    listen(sockfd, 5);
-
-    int epfd = epoll_create(1);
-    struct epoll_event ev, events[1024];
-    ev.events = EPOLLIN;
-    ev.data.fd = sockfd;
-    epoll_ctl(epfd, EPOLL_CTL_ADD, sockfd, &ev);
-
-    ev.data.fd = exitPipe[0];
-    epoll_ctl(epfd, EPOLL_CTL_ADD, exitPipe[0], &ev);
-
-    while (1) {
-        int ready = epoll_wait(epfd, events, 1024, -1);
-        for (int i = 0; i < ready; ++i) {
-            if (events[i].data.fd == sockfd) {
-                int netfd = accept(sockfd, NULL, NULL);
-                printf("Accepted connection on fd %d\n", netfd);
-
-                task_param_t param;
-                param.upload.netfd = netfd;
-                strcpy(param.upload.filename, "uploadfile.txt");
-                enQueue(&threadPool.taskQueue, TASK_UPLOAD, &param);
-            } else if (events[i].data.fd == exitPipe[0]) {
-                printf("Exiting...\n");
-                threadPoolDestroy(&threadPool);
-                close(sockfd);
-                return 0;
-            }
-        }
-    }
-} 
 
 // 1. server_init函数
 //整个服务器初始化
