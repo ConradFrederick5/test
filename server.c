@@ -1,4 +1,93 @@
+
+//超时队列和session需要放前面
+typedef struct timeout_wheel {
+    int timer;                  // 当前时间槽指针
+    slot_list_t slots[TIME_SLICE]; // 时间轮
+    int index[MAX_FD];         // netfd所在slot下标
+} timeout_wheel_t;
+
+typedef struct Session_s {
+    int netfd;
+    char user_name[256];
+    char virtual_cwd[PATH_MAX]; // 用户当前目录
+    int cwd_id;                 // 当前目录id
+    MYSQL* conn;
+}Session_t;
+
+
+
 //0.线程池
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <sys/epoll.h>
+#include <signal.h>
+#include <fcntl.h>
+
+// 任务类型枚举
+typedef enum {
+    TASK_UPLOAD,
+    TASK_DOWNLOAD_SMALL,
+    TASK_DOWNLOAD_LARGE
+} task_type_t;
+
+// 通用任务参数类型
+typedef union {
+    struct {
+        int netfd;
+        char filename[256];
+    } upload;
+
+    struct {
+        int netfd;
+        char filename[256];
+    } download_small;
+
+    struct {
+        int netfd;
+        char filename[256];
+        off_t offset;
+        size_t size;
+        unsigned int chunk_index;
+        unsigned int chunk_count;
+    } download_large;
+} task_param_t;
+
+// 任务队列节点结构体
+typedef struct node_s {
+    task_type_t type;
+    task_param_t param;
+    struct node_s* pNext;
+} node_t;
+
+// 任务队列结构体
+typedef struct {
+    node_t* pFront;
+    node_t* pRear;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    int queueSize;
+} taskQueue_t;
+
+// 线程池结构体
+typedef struct {
+    pthread_t* threads;
+    taskQueue_t taskQueue;
+    int threadNum;
+    int exitFlag;
+} thread_pool_t;
+
+
+
+void taskQueueInit(taskQueue_t* queue);
+void enQueue(taskQueue_t* queue, task_type_t type, task_param_t* param);
+node_t* deQueue(taskQueue_t* queue);
+void* workerThread(void* arg);
+void threadPoolInit(thread_pool_t* pool, int threadNum);
+void threadPoolDestroy(thread_pool_t* pool);
+void handler(int sig);
 
 
 // 1. server_init
@@ -26,13 +115,7 @@ int server_init(server_context_t* ctx, const char* conf_path,const char* log_pat
 
 //1.0 session
 #include <limits.h>
-typedef struct Session_s {
-    int netfd;
-    char user_name[256];
-    char virtual_cwd[PATH_MAX]; // 用户当前目录
-    int cwd_id;                 // 当前目录id
-    MYSQL* conn;
-}Session_t;
+
 
 int session_init(server_context_t* ctx,MYSQL* conn,const char* user_name,int netfd);
 void session_release(Session_t* session);
@@ -70,11 +153,7 @@ typedef struct slot_list {
     int size;
 } slot_list_t;
 
-typedef struct timeout_wheel {
-    int timer;                  // 当前时间槽指针
-    slot_list_t slots[TIME_SLICE]; // 时间轮
-    int index[MAX_FD];         // netfd所在slot下标
-} timeout_wheel_t;
+
 
 void timeout_wheel_init(timeout_wheel_t* wheel);
 void _remove_usr_from_slot(slot_list_t* slot, int netfd);
@@ -458,6 +537,181 @@ int main() {
 
 
 
+// 0.线程池
+
+// 任务队列初始化
+void taskQueueInit(taskQueue_t* queue) {
+    queue->pFront = queue->pRear = NULL;
+    queue->queueSize = 0;
+    pthread_mutex_init(&queue->mutex, NULL);
+    pthread_cond_init(&queue->cond, NULL);
+}
+
+// 入队任务
+void enQueue(taskQueue_t* queue, task_type_t type, task_param_t* param) {
+    node_t* newNode = (node_t*)malloc(sizeof(node_t));
+    newNode->type = type;
+    memcpy(&newNode->param, param, sizeof(task_param_t));
+    newNode->pNext = NULL;
+
+    pthread_mutex_lock(&queue->mutex);
+    if (queue->queueSize == 0) {
+        queue->pFront = queue->pRear = newNode;
+    } else {
+        queue->pRear->pNext = newNode;
+        queue->pRear = newNode;
+    }
+    queue->queueSize++;
+    pthread_cond_signal(&queue->cond);
+    pthread_mutex_unlock(&queue->mutex);
+}
+
+// 出队任务
+node_t* deQueue(taskQueue_t* queue) {
+    pthread_mutex_lock(&queue->mutex);
+    while (queue->queueSize == 0) {
+        pthread_cond_wait(&queue->cond, &queue->mutex);
+    }
+    node_t* frontNode = queue->pFront;
+    queue->pFront = queue->pFront->pNext;
+    if (queue->pFront == NULL) {
+        queue->pRear = NULL;
+    }
+    queue->queueSize--;
+    pthread_mutex_unlock(&queue->mutex);
+    return frontNode;
+}
+
+// 任务处理函数
+void* workerThread(void* arg) {
+    thread_pool_t* pool = (thread_pool_t*)arg;
+    while (1) {
+        if (pool->exitFlag) break;
+
+        node_t* task = deQueue(&pool->taskQueue);
+        if (task) {
+            switch (task->type) {
+                case TASK_UPLOAD:
+                    printf("处理上传任务: %s\n", task->param.upload.filename);
+                    break;
+                case TASK_DOWNLOAD_SMALL:
+                    printf("处理单线程下载任务: %s\n", task->param.download_small.filename);
+                    break;
+                case TASK_DOWNLOAD_LARGE:
+                    printf("处理分块下载任务: %u/%u of file: %s\n",
+                           task->param.download_large.chunk_index + 1,
+                           task->param.download_large.chunk_count,
+                           task->param.download_large.filename);
+                    break;
+                default:
+                    printf("未知类型\n");
+            }
+            free(task);
+        }
+    }
+    return NULL;
+}
+
+// 线程池初始化
+void threadPoolInit(thread_pool_t* pool, int threadNum) {
+    pool->threadNum = threadNum;
+    pool->exitFlag = 0;
+    pool->threads = (pthread_t*)malloc(threadNum * sizeof(pthread_t));
+    taskQueueInit(&pool->taskQueue);
+    //创建工人
+    for (int i = 0; i < threadNum; ++i) {
+        pthread_create(&pool->threads[i], NULL, workerThread, pool);
+    }
+}
+
+// 线程池销毁
+void threadPoolDestroy(thread_pool_t* pool) {
+    pthread_mutex_lock(&pool->taskQueue.mutex);
+    pool->exitFlag = 1;
+    pthread_cond_broadcast(&pool->taskQueue.cond);
+    pthread_mutex_unlock(&pool->taskQueue.mutex);
+
+    for (int i = 0; i < pool->threadNum; ++i) {
+        pthread_join(pool->threads[i], NULL);
+    }
+    free(pool->threads);
+}
+
+// 信号处理函数
+void handler(int sig) {
+    printf("收到信号 %d , 退出中...\n", sig);
+}
+
+// 主函数
+int main(int argc, char* argv[]) {
+    if (argc != 4) {
+        printf("Usage: %s <IP> <Port> <WorkerNum>\n", argv[0]);
+        return -1;
+    }
+
+    int exitPipe[2];
+    pipe(exitPipe);
+    if (fork()) {
+        // 父进程
+        close(exitPipe[0]);
+        signal(SIGUSR1, handler);
+        wait(NULL);
+        printf("Parent is going to exit!\n");
+        exit(0);
+    }
+
+    // 子进程
+    close(exitPipe[1]);
+
+    thread_pool_t threadPool;
+    int workerNum = atoi(argv[3]);
+    threadPoolInit(&threadPool, workerNum);
+
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd == -1) {
+        perror("Socket creation failed");
+        exit(1);
+    }
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(atoi(argv[2]));
+    addr.sin_addr.s_addr = inet_addr(argv[1]);
+
+    if (bind(sockfd, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
+        perror("Bind failed");
+        exit(1);
+    }
+    listen(sockfd, 5);
+
+    int epfd = epoll_create(1);
+    struct epoll_event ev, events[1024];
+    ev.events = EPOLLIN;
+    ev.data.fd = sockfd;
+    epoll_ctl(epfd, EPOLL_CTL_ADD, sockfd, &ev);
+
+    ev.data.fd = exitPipe[0];
+    epoll_ctl(epfd, EPOLL_CTL_ADD, exitPipe[0], &ev);
+
+    while (1) {
+        int ready = epoll_wait(epfd, events, 1024, -1);
+        for (int i = 0; i < ready; ++i) {
+            if (events[i].data.fd == sockfd) {
+                int netfd = accept(sockfd, NULL, NULL);
+                printf("Accepted connection on fd %d\n", netfd);
+
+                task_param_t param;
+                param.upload.netfd = netfd;
+                strcpy(param.upload.filename, "uploadfile.txt");
+                enQueue(&threadPool.taskQueue, TASK_UPLOAD, &param);
+            } else if (events[i].data.fd == exitPipe[0]) {
+                printf("Exiting...\n");
+                threadPoolDestroy(&threadPool);
+                close(sockfd);
+                return 0;
+            }
+        }
+    }
+} 
 
 // 1. server_init函数
 //整个服务器初始化
@@ -851,7 +1105,8 @@ int server_init(server_context_t* ctx, const char* conf_path, const char* log_pa
 
     // 3. 线程池初始化（只用于上传/下载这样的长命令）
     threadPoolInit(&ctx->threadPool, WORKER_NUM);
-    makeWorker(&ctx->threadPool);
+
+    
 
     // 4. TCP初始化
     ctx->listen_fd = tcpInit(conf_path);
