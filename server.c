@@ -4,10 +4,17 @@
 #include <mysql/mysql.h>
 #include <limits.h>
 #include <string.h>
+#include "./include/l8w8jwt/include/l8w8jwt/decode.h" 
+#include "./include/l8w8jwt/include/l8w8jwt/encode.h"
+//11. l8w8jwt
+int encode(char *key, char *usr_name, char *token);
+int decode(char *key, char *usr_name, char *token);
+
+
 //1.3超时队列
 #define TIME_SLICE 30      // 超时时间轮长度，比如30s
 #define MAX_FD 1024       // 支持的最大netfd/net_fd数（可按需调整）
-
+#define SALT_LEN 16 // 盐值长度
 
 typedef struct slot_node {
     int netfd;// 可用作fd或唯一id
@@ -111,11 +118,11 @@ int epoll_add(int epfd, int fd);
 int epoll_del(int epfd, int fd);
 
 
-void taskQueueInit(taskQueue_t* queue);
+int taskQueueInit(taskQueue_t* queue);
 void enQueue(taskQueue_t* queue, task_type_t type, task_param_t* param);
 node_t* deQueue(taskQueue_t* queue);
 void* workerThread(void* arg);
-void threadPoolInit(thread_pool_t* pool, int threadNum);
+int threadPoolInit(thread_pool_t* pool, int threadNum);
 void threadPoolDestroy(thread_pool_t* pool);
 void handler(int sig);
 void close_fd_on_timeout(int fd);
@@ -136,7 +143,7 @@ typedef struct {
     MYSQL* conn;
     Session_t session[1024];
     int session_cnt;
-
+    int hashmap[1024];
     //还有其他服务器需要的，后面都可以放在这里
 } server_context_t;
 
@@ -147,7 +154,7 @@ int server_init(server_context_t* ctx, const char* conf_path,const char* log_pat
 #include <limits.h>
 
 
-int session_init(server_context_t* ctx,MYSQL* conn,const char* user_name,int netfd);
+int session_insert(server_context_t* ctx,MYSQL* conn,const char* user_name,int netfd);
 void session_release(Session_t* session);
 int session_clean(server_context_t* ctx,int netfd);
 
@@ -370,8 +377,8 @@ int handle_command(Session_t* session, tlv_t* tlv);
 // 6. usr
 
 int salt_maker(char *salt);
-int usr_register(tlv_t *tlv, int net_fd, MYSQL* conn);
-int usr_login(tlv_t* tlv, int net_fd, MYSQL* conn);
+int usr_register(server_context_t * ctx,tlv_t *tlv, int net_fd, MYSQL* conn);
+int usr_login(server_context_t * ctx,tlv_t* tlv, int net_fd, MYSQL* conn);
 
 
 // 7. cmd 
@@ -474,31 +481,35 @@ int main() {
     server_init(&ctx, "./server.conf", "./log");
 
     time_t last_tick = time(NULL); // 初始化时间轮的 last_tick
+
     while (1) {
-        //====时间轮tick：每秒tick一次，批量处理超时===
+        //==== 时间轮 tick：每秒 tick 一次，批量处理超时 ===
         time_t now = time(NULL);
         if (now != last_tick) {
             last_tick = now;
-            timeout_wheel_tick(&ctx.timeout_wheel, close_fd_on_timeout); // 修正超时轮引用
+            timeout_wheel_tick(&ctx.timeout_wheel, close_fd_on_timeout); 
         }
 
         struct epoll_event ready_arr[WORKER_NUM + 4]; // 定义 epoll 事件数组
         int ready_num = epoll_wait(ctx.epfd, ready_arr, WORKER_NUM + 4, 100);
         if (ready_num == 0) {
-            // 时间轮tick统一处理超时，无就绪也无所谓
+            // 时间轮 tick 统一处理超时，无就绪也无所谓
             continue;
         }
+
+
+        
+
         for (int i = 0; i < ready_num; ++i) {
             int fd = ready_arr[i].data.fd;
-            // 新连接处理
+            // 新连接
             if (fd == ctx.listen_fd) {
-                int netfd = accept(ctx.listen_fd, NULL, NULL);
-                ERROR_CHECK(netfd, -1, "accept");
+            int netfd = accept(ctx.listen_fd, NULL, NULL);
+            ERROR_CHECK(netfd, -1, "accept");
 
-                // 新连接加入监听和时间轮，开始计时
-                epoll_add(ctx.epfd, netfd);
-                timeout_wheel_touch(&ctx.timeout_wheel, netfd);
-
+            // 新连接加入监听和时间轮，开始计时
+            epoll_add(ctx.epfd, netfd);
+            timeout_wheel_touch(&ctx.timeout_wheel, netfd);
             }
             // 退出信号处理
             else if (fd == ctx.exitPipe[0]) {
@@ -510,78 +521,103 @@ int main() {
                 }
                 pthread_exit(NULL);
             }
-            // 收到TLV包处理
+            // 收到 TLV 包处理
             else {
                 tlv_t* tlv = tlv_recv(fd);
                 if (!tlv) {
+                    // 关闭连接并清理资源
                     epoll_del(ctx.epfd, fd);
                     close(fd);
-                    // 断开连接时无需手动从时间轮删除，tick时会自动清理
                     continue;
                 }
-                // 每收到一次客户端请求包，都刷新fd的超时时间
+
+                // 每收到一次客户端请求包，都刷新 fd 的超时时间
                 timeout_wheel_touch(&ctx.timeout_wheel, fd);
 
-                // 上传/下载任务分发
-                if (tlv->type / 16 == 2) { // 上传/下载
-                    task_param_t task_param;
-                    memset(&task_param, 0, sizeof(task_param_t));
-                    task_param.upload.netfd = fd;
+                // ===== 处理 TOKEN 包 =====需要合并入/2里
+                if (tlv->type == TRANS_TOKEN) {
+                    // char usr_name[64], token[128], out_sub[256];
+                    // size_t out_sub_len = sizeof(out_sub);
 
-                    // 这里需要重写的，需要根据导图的流程
-                    //strcpy(task_param.upload.filename, tlv->value); // 使用 TLV 数据
+                    // // 从 TLV 中解析用户名和 Token
+                    // parse_token_tlv(tlv, usr_name, sizeof(usr_name), token, sizeof(token));
 
+                    // // 校验 Token
+                    // if (token_validate("secret_key", usr_name, token, out_sub, out_sub_len) != 0) {
+                    //     fprintf(stderr, "Token 验证失败: fd=%d\n", fd);
+                    //     tlv_free(tlv);
+                    //     continue;
+                    // }
 
-                    
-                    if (tlv->type == CMD_UPLOAD) {
-                        // 上传任务入队
-                        enQueue(&ctx.threadPool.taskQueue, TASK_UPLOAD, &task_param);
-                    }
-                    //要返回一个meta让客户端知道是否多点下载
-                    else if (tlv->type == CMD_DOWNLOAD) {
-                        
-                        size_t file_size;// = get_file_size(tlv->value); // 获取文件大小
-                        
-                        if (file_size <= 100 * 1024 * 1024) { // 小文件下载
-                            enQueue(&ctx.threadPool.taskQueue, TASK_DOWNLOAD_SMALL, &task_param);
-                        }
-                        
+                    // // Token 验证通过，解析分片信息并入队
+                    // chunk_info_t chunk_info;
+                    // parse_chunk_info_tlv(tlv, &chunk_info);
 
-                        //大的task传进来，让它分成小的
-                        else { // 大文件，按100MB分片下载
-                            size_t offset = 0;
-                            unsigned int chunk_index = 0;
-                            
-                            //计算总的分片数，向上取整，把不同的分片发给子线程
-                            unsigned int chunk_count = (file_size + 100 * 1024 * 1024 - 1) / (100 * 1024 * 1024);
-                            while (offset < file_size) {
-                                
-                                //！！！！！计算分片大小：务必好好检查！！！！！！！！！！
-                                size_t chunk_size = (file_size - offset > 100 * 1024 * 1024) ? 100 * 1024 * 1024 : file_size - offset;
-                                task_param_t chunk_param;
-                                memset(&chunk_param, 0, sizeof(chunk_param));
+                    // task_param_t task_param;
+                    // memset(&task_param, 0, sizeof(task_param));
+                    // task_param.download_large.netfd = fd;
+                    // strncpy(task_param.download_large.filename, chunk_info.filename, sizeof(task_param.download_large.filename));
+                    // task_param.download_large.offset = chunk_info.offset;
+                    // task_param.download_large.size = chunk_info.size;
+                    // task_param.download_large.chunk_index = chunk_info.chunk_index;
+                    // task_param.download_large.chunk_count = chunk_info.chunk_count;
 
-                                chunk_param.download_large.netfd = fd;
+                    // // 将分片任务入队
+                    // enQueue(&ctx.threadPool.taskQueue, TASK_DOWNLOAD_LARGE, &task_param);
 
-                                // 这里需要重写的，需要根据导图的流程
-                                
-                                // strcpy(chunk_param.download_large.filename, tlv->value);
-                                chunk_param.download_large.offset = offset;
-                                chunk_param.download_large.size = chunk_size;
-                                chunk_param.download_large.chunk_index = chunk_index;
-                                chunk_param.download_large.chunk_count = chunk_count;
-                                enQueue(&ctx.threadPool.taskQueue, TASK_DOWNLOAD_LARGE, &chunk_param);
-                                offset += chunk_size;
-                                chunk_index++;
-                            }
-                        }
-                    }
-                    tlv_free(tlv); // 释放TLV资源
+                    // tlv_free(tlv);
+                    // continue;
                 }
-                // 其他命令
+
+                // ===== 上传/下载任务分发 =====
+                if (tlv->type / 16 == 2) { // 上传/下载
+                    // task_param_t task_param;
+                    // memset(&task_param, 0, sizeof(task_param_t));
+                    // task_param.upload.netfd = fd;
+
+                    // if (tlv->type == CMD_UPLOAD) {
+                    //     // 上传任务入队
+                    //     enQueue(&ctx.threadPool.taskQueue, TASK_UPLOAD, &task_param);
+                    // }
+                    // else if (tlv->type == CMD_DOWNLOAD) {
+                    //     // 获取文件大小
+                    //     size_t file_size = get_file_size(tlv->value);
+
+                    //     //小文件返回允许下载，大文件返回信息让客户端创子线程带token来
+                        
+                    //     if (file_size <= 100 * 1024 * 1024) { // 小文件下载
+                    //         enQueue(&ctx.threadPool.taskQueue, TASK_DOWNLOAD_SMALL, &task_param);
+                    //     }
+                    //     else { // 大文件按分片下载
+                    //         size_t offset = 0;
+                    //         unsigned int chunk_index = 0;
+                    //         unsigned int chunk_count = (file_size + 100 * 1024 * 1024 - 1) / (100 * 1024 * 1024);
+
+                    //         while (offset < file_size) {
+                    //             size_t chunk_size = (file_size - offset > 100 * 1024 * 1024) ? 100 * 1024 * 1024 : file_size - offset;
+
+                    //             task_param_t chunk_param;
+                    //             memset(&chunk_param, 0, sizeof(chunk_param));
+                    //             chunk_param.download_large.netfd = fd;
+                    //             strncpy(chunk_param.download_large.filename, tlv->value, sizeof(chunk_param.download_large.filename));
+                    //             chunk_param.download_large.offset = offset;
+                    //             chunk_param.download_large.size = chunk_size;
+                    //             chunk_param.download_large.chunk_index = chunk_index;
+                    //             chunk_param.download_large.chunk_count = chunk_count;
+
+                    //             // 分片任务入队
+                    //             enQueue(&ctx.threadPool.taskQueue, TASK_DOWNLOAD_LARGE, &chunk_param);
+                    //             offset += chunk_size;
+                    //             chunk_index++;
+                    //         }
+                    //     }
+                    // }
+                    // tlv_free(tlv);
+                }
                 else {
-                    handle_command(&ctx.session[fd], tlv); // 主线程处理非上传/下载的命令
-                    tlv_free(tlv); // 修正释放TLV资源的方式
+                    // 其他命令
+                    handle_command(&ctx.session[fd], tlv);
+                    tlv_free(tlv);
                 }
             }
         }
@@ -591,33 +627,69 @@ int main() {
 
 
 
-
-
 // 0.线程池
+
+
+
 // 初始化任务队列
-void taskQueueInit(taskQueue_t* queue) {
-    queue->pFront = queue->pRear = NULL;
+
+
+
+void taskQueueDestroy(taskQueue_t* queue) {
+    pthread_mutex_lock(&queue->mutex);
+
+    // 清空队列中的所有任务节点，释放内存
+    while (queue->pFront != NULL) {
+        node_t* node = queue->pFront;
+        queue->pFront = queue->pFront->pNext;
+        free(node);
+    }
+
+    queue->pRear = NULL;
     queue->queueSize = 0;
-    pthread_mutex_init(&queue->mutex, NULL);
-    pthread_cond_init(&queue->cond, NULL);
+
+    pthread_mutex_unlock(&queue->mutex);
+
+    // 销毁互斥锁和条件变量
+    pthread_mutex_destroy(&queue->mutex);
+    pthread_cond_destroy(&queue->cond);
 }
+
+// 初始化任务队列
+int taskQueueInit(taskQueue_t* queue) {
+    queue->pFront = queue->pRear = NULL; // 队列为空
+    queue->queueSize = 0;               // 队列大小初始化为 0
+    pthread_mutex_init(&queue->mutex, NULL); // 初始化互斥锁
+    pthread_cond_init(&queue->cond, NULL); 
+    return 0;// 初始化条件变量
+}
+
 
 // 入队任务
 void enQueue(taskQueue_t* queue, task_type_t type, task_param_t* param) {
+    // 创建新任务节点
     node_t* newNode = (node_t*)malloc(sizeof(node_t));
+    if (!newNode) {
+        perror("Failed to allocate memory for new task node");
+        return;
+    }
     newNode->type = type;
     memcpy(&newNode->param, param, sizeof(task_param_t));
     newNode->pNext = NULL;
 
     pthread_mutex_lock(&queue->mutex);
-    if (queue->queueSize == 0) {
-        queue->pFront = queue->pRear = newNode;
+
+    // 添加任务到队列尾部
+    if (queue->pRear == NULL) {
+        queue->pFront = queue->pRear = newNode; // 队列为空时，头尾指针都指向新节点
     }
     else {
-        queue->pRear->pNext = newNode;
+        queue->pRear->pNext = newNode; // 队列不为空时，链到尾部
         queue->pRear = newNode;
     }
     queue->queueSize++;
+
+    // 通知等待的线程有新任务
     pthread_cond_signal(&queue->cond);
     pthread_mutex_unlock(&queue->mutex);
 }
@@ -625,131 +697,122 @@ void enQueue(taskQueue_t* queue, task_type_t type, task_param_t* param) {
 // 出队任务
 node_t* deQueue(taskQueue_t* queue) {
     pthread_mutex_lock(&queue->mutex);
+
+    // 等待任务队列非空
     while (queue->queueSize == 0) {
         pthread_cond_wait(&queue->cond, &queue->mutex);
     }
+
+    // 取出队列头部任务
     node_t* frontNode = queue->pFront;
     queue->pFront = queue->pFront->pNext;
+
     if (queue->pFront == NULL) {
-        queue->pRear = NULL;
+        queue->pRear = NULL; // 队列为空时，尾指针也置为 NULL
     }
     queue->queueSize--;
+
     pthread_mutex_unlock(&queue->mutex);
     return frontNode;
 }
 
-// 销毁任务队列
-void taskQueueDestroy(taskQueue_t* queue) {
-    pthread_mutex_lock(&queue->mutex);
-    while (queue->queueSize > 0) {
-        node_t* node = deQueue(queue);
-        free(node);
+// 销毁线程池，包括任务队列（防止资源泄露）
+void threadPoolDestroy(thread_pool_t* pool) {
+    // 通知所有线程退出
+    pthread_mutex_lock(&pool->taskQueue.mutex);
+    pool->exitFlag = 1;
+    pthread_cond_broadcast(&pool->taskQueue.cond);
+    pthread_mutex_unlock(&pool->taskQueue.mutex);
+
+    // 等待所有线程退出
+    for (int i = 0; i < pool->threadNum; ++i) {
+        pthread_join(pool->threads[i], NULL);
     }
-    pthread_mutex_unlock(&queue->mutex);
-    pthread_mutex_destroy(&queue->mutex);
-    pthread_cond_destroy(&queue->cond);
+
+    // 释放线程数组
+    free(pool->threads);
+
+    // 销毁任务队列
+    taskQueueDestroy(&pool->taskQueue);
 }
+
+// 线程池初始化函数copi
+int threadPoolInit(thread_pool_t* pool, int threadNum) {
+    if (threadNum <= 0) {
+        fprintf(stderr, "无效的线程数量: %d\n", threadNum);
+        return -1; 
+    }
+
+    pool->threadNum = threadNum;
+    pool->exitFlag = 0; // 初始化退出标志
+
+    // 分配线程数组内存
+    pool->threads = (pthread_t*)malloc(threadNum * sizeof(pthread_t));
+    if (!pool->threads) {
+        perror("分配线程内存失败");
+        return -1;
+    }
+
+    // 初始化任务队列
+    if (taskQueueInit(&pool->taskQueue) != 0) {
+        fprintf(stderr, "任务队列初始化失败\n");
+        free(pool->threads);
+        return -1;
+    }
+
+    // 创建线程
+    for (int i = 0; i < threadNum; ++i) {
+        if (pthread_create(&pool->threads[i], NULL, workerThread, pool) != 0) {
+            perror("创建线程失败"); 
+            pool->threadNum = i; // 已成功创建的线程数
+
+            // 取消已创建的线程
+            for (int j = 0; j < i; ++j) {
+                pthread_cancel(pool->threads[j]);
+            }
+
+            // 释放资源
+            free(pool->threads);
+            taskQueueDestroy(&pool->taskQueue);
+            return -1;
+        }
+    }
+
+    return 0; 
+}
+
 
 // 任务处理函数
 void* workerThread(void* arg) {
     thread_pool_t* pool = (thread_pool_t*)arg;
     while (1) {
-        if (pool->exitFlag) break; // 检查线程池退出标志
+        if (pool->exitFlag) break;
 
-        node_t* task = deQueue(&pool->taskQueue); // 从任务队列中取任务
+        node_t* task = deQueue(&pool->taskQueue);
         if (task) {
             switch (task->type) {
-                case TASK_UPLOAD:
-                    printf("处理上传任务: %s\n", task->param.upload.filename);
-                    // 执行上传逻辑
-                    break;
-
-                case TASK_DOWNLOAD_SMALL:
-                    printf("处理单线程下载任务: %s\n", task->param.download_small.filename);
-                    // 执行小文件下载逻辑
-                    break;
-
-                case TASK_DOWNLOAD_LARGE:
-                    printf("处理分块下载任务: %u/%u of file: %s\n",
-                           task->param.download_large.chunk_index + 1,
-                           task->param.download_large.chunk_count,
-                           task->param.download_large.filename);
-                    // 执行分块下载逻辑
-                    break;
-
-                default:
-                    printf("未知任务类型\n");
+            case TASK_UPLOAD:
+                printf("处理上传任务: %s\n", task->param.filename);
+                break;
+            case TASK_DOWNLOAD_SMALL:
+                printf("处理单线程下载任务: %s\n", task->param.filename);
+                break;
+            case TASK_DOWNLOAD_LARGE:
+                printf("处理分块下载任务: %u/%u of file: %s\n",
+                    task->param.chunk_index + 1,
+                    task->param.chunk_count,
+                    task->param.filename);
+                break;
+            default:
+                printf("未知任务类型\n");
             }
-            free(task); // 释放任务节点内存
+            free(task);
         }
     }
     return NULL;
 }
 
-// 初始化线程池
-int threadPoolInit(thread_pool_t* pool, int threadNum) {
-    if (threadNum <= 0) return -1;
-    pool->threadNum = threadNum;
-    pool->threads = (pthread_t*)malloc(threadNum * sizeof(pthread_t));
-    if (!pool->threads) {
-        perror("Failed to allocate threads");
-        return -1;
-    }
-    taskQueueInit(&pool->taskQueue);
-    pthread_mutex_init(&pool->mutex, NULL);
-    pthread_cond_init(&pool->cond, NULL);
-    pool->exitFlag = 0;
 
-    for (int i = 0; i < threadNum; ++i) {
-        if (pthread_create(&pool->threads[i], NULL, workerThread, pool) != 0) {
-            perror("Failed to create thread");
-            free(pool->threads);
-            return -1;
-        }
-    }
-    return 0;
-}
-
-// 销毁线程池
-void threadPoolDestroy(thread_pool_t* pool) {
-    pthread_mutex_lock(&pool->taskQueue.mutex);
-    pool->exitFlag = 1;
-    pthread_cond_broadcast(&pool->taskQueue.cond);
-    pthread_mutex_unlock(&pool->taskQueue.mutex);
-
-    for (int i = 0; i < pool->threadNum; ++i) {
-        pthread_join(pool->threads[i], NULL);
-    }
-    free(pool->threads);
-    taskQueueDestroy(&pool->taskQueue);
-}
-
-
-
-// 线程池初始化
-void threadPoolInit(thread_pool_t* pool, int threadNum) {
-    pool->threadNum = threadNum;
-    pool->exitFlag = 0;
-    pool->threads = (pthread_t*)malloc(threadNum * sizeof(pthread_t));
-    taskQueueInit(&pool->taskQueue);
-    //创建工人
-    for (int i = 0; i < threadNum; ++i) {
-        pthread_create(&pool->threads[i], NULL, workerThread, pool);
-    }
-}
-
-// 线程池销毁
-void threadPoolDestroy(thread_pool_t* pool) {
-    pthread_mutex_lock(&pool->taskQueue.mutex);
-    pool->exitFlag = 1;
-    pthread_cond_broadcast(&pool->taskQueue.cond);
-    pthread_mutex_unlock(&pool->taskQueue.mutex);
-
-    for (int i = 0; i < pool->threadNum; ++i) {
-        pthread_join(pool->threads[i], NULL);
-    }
-    free(pool->threads);
-}
 
 // 信号处理函数
 void handler(int sig) {
@@ -758,60 +821,84 @@ void handler(int sig) {
 
 
 // 1. server_init函数
-//整个服务器初始化
-int server_init(server_context_t* ctx, const char* conf_path,const char* log_path) {
-    
 
-    // 0.日志系统优先
+int server_init(server_context_t* ctx, const char* conf_path, const char* log_path) {
+    // 1. 日志系统优先
     init_logger(log_path);
 
-    // 1. 退出管道、信号
-    pipe(ctx->exitPipe);
+    // 2. 退出管道、信号
+    if (pipe(ctx->exitPipe) == -1) {
+        perror("Failed to create pipe");
+        close_logger();
+        return -1;
+    }
+
     if (fork() != 0) {
+        // 父进程逻辑
         close(ctx->exitPipe[0]);
-        // 暂时用signal
         signal(SIGUSR1, sig_handler1);
         signal(SIGINT, sig_handler1);
-        wait(NULL);
+        wait(NULL); // 等待子进程退出
+        close(ctx->exitPipe[1]);
+        close_logger(); // 关闭日志系统
         exit(0);
     }
+
+    // 子进程逻辑
     signal(SIGINT, sig_handler2);
     close(ctx->exitPipe[1]);
 
-    // 2. 线程池初始化（只用于上传/下载这样的长命令）
-    threadPoolInit(&ctx->threadPool, WORKER_NUM);
+    // 3. 线程池初始化（只用于上传/下载这样的长命令）
+    if (threadPoolInit(&ctx->threadPool, WORKER_NUM) != 0) {
+        fprintf(stderr, "Failed to initialize thread pool\n");
+        close_logger();
+        return -1;
+    }
 
-
-    // 3. TCP初始化
+    // 4. TCP初始化
     ctx->listen_fd = tcpInit(conf_path);
-    ctx->epfd = epoll_create(1);
-    ERROR_CHECK(ctx->epfd, -1, "epoll_create");
+    if (ctx->listen_fd == -1) {
+        fprintf(stderr, "Failed to initialize TCP\n");
+        close_logger();
+        return -1;
+    }
 
-    // 4. 任务队列初始化
+    ctx->epfd = epoll_create(1);
+    if (ctx->epfd == -1) {
+        perror("Failed to create epoll");
+        close_logger();
+        return -1;
+    }
+
+    // 5. 任务队列初始化
     taskQueueInit(&ctx->threadPool.taskQueue);
 
-    // 5. 时间轮初始化
+    // 6. 时间轮初始化
     timeout_wheel_init(&ctx->timeout_wheel);
 
-    // 6. epoll添加监听
+    // 7. epoll添加监听
     epoll_add(ctx->epfd, ctx->listen_fd);
     epoll_add(ctx->epfd, ctx->exitPipe[0]);
 
-    // 7. 数据库连接
+    // 8. 数据库连接
     ctx->conn = NULL;
-    db_connect(&ctx->conn);
+    if (db_connect(&ctx->conn) != 0) {
+        fprintf(stderr, "Failed to connect to database\n");
+        close_logger();
+        return -1;
+    }
 
-    // 8. session清0
+    // 9. session清零
     memset(ctx->session, 0, sizeof(ctx->session));
     ctx->session_cnt = 0;
+    memset(ctx->hashmap,0,sizeof(ctx->session));
 
     return 0; // 子进程返回，父进程不返回
 }
 
-
 //1.0 session
 // session结构体数据初始化
-int session_init(server_context_t* ctx,MYSQL* conn,const char* user_name,int netfd){
+int session_insert(server_context_t* ctx,MYSQL* conn,const char* user_name,int netfd){
 	ctx->session[ctx->session_cnt].netfd = netfd;
 	memcpy(ctx->session[ctx->session_cnt].user_name,user_name,strlen(user_name)+1);
 	memcpy(ctx->session[ctx->session_cnt].virtual_cwd,"/",2);
@@ -824,7 +911,7 @@ int session_init(server_context_t* ctx,MYSQL* conn,const char* user_name,int net
 //clean调用release完成session结构体的释放
 int session_clean(server_context_t* ctx,int netfd){ 
     // 获取当前要删除的session在数组中的下标
-	int index = ctx->hash[netfd];
+	int index = ctx->hashmap[netfd];
 	int last = ctx->session_cnt - 1;
 	
 	// 释放被覆盖（即将被删除的）session资源
@@ -1074,7 +1161,7 @@ void timeout_wheel_tick(timeout_wheel_t* wheel, void (*on_timeout)(int netfd)) {
 
 void close_fd_on_timeout(int fd) {
     // 关闭超时fd，移除epoll监听，做清理
-    epoll_del(epfd, fd);
+    //epoll_del(epfd, fd);
     close(fd);
     // 其它资源释放（如session、内存等）
 
@@ -1083,58 +1170,9 @@ void close_fd_on_timeout(int fd) {
 
 
 
-//1.4服务器整体初始化
-int server_init(server_context_t* ctx, const char* conf_path, const char* log_path) {
-    // 1. 日志初始化
-    init_logger(log_path);
-
-    // 2. 退出管道、信号
-    pipe(ctx->exitPipe);
-    if (fork() != 0) {
-        close(ctx->exitPipe[0]);
-        signal(SIGUSR1, sig_handler1);
-        signal(SIGINT, sig_handler1);
-        wait(NULL);
-        close_logger();
-        exit(0);
-    }
-    signal(SIGINT, sig_handler2);
-    close(ctx->exitPipe[1]);
-
-    // 3. 线程池初始化（只用于上传/下载这样的长命令）
-    threadPoolInit(&ctx->threadPool, WORKER_NUM);
-
-    
-
-    // 4. TCP初始化
-    ctx->listen_fd = tcpInit(conf_path);
-    ctx->epfd = epoll_create(1);
-    ERROR_CHECK(ctx->epfd, -1, "epoll_create");
-
-    // 5. 任务队列初始化
-    taskQueueInit(&ctx->threadPool.taskQueue);
-
-    // 6. 时间轮初始化
-    timeout_wheel_init(&ctx->timeout_wheel);
-
-    // 7. epoll添加监听
-    epoll_add(ctx->epfd, ctx->listen_fd);
-    epoll_add(ctx->epfd, ctx->exitPipe[0]);
-
-    // 8. 数据库连接
-    ctx->conn = NULL;
-    db_connect(&ctx->conn);
-
-    return 0; // 子进程返回，父进程不返回
-}
-
-
-
 // 2. database 函数
 
 
-
-d
 
 // 数据库连接函数
 int db_connect(MYSQL** pconn){
@@ -1606,7 +1644,7 @@ int usr_register(server_context_t* ctx,tlv_t *tlv, int net_fd, MYSQL* conn)
 {
     char usr_name[512] = {0};
     char crptpswd[512] = {0};
-    char salt[SATL_LEN];
+    char salt[SALT_LEN];
     char token[512]= { 0 };
 
     //查数据库验证重名
@@ -1615,7 +1653,7 @@ int usr_register(server_context_t* ctx,tlv_t *tlv, int net_fd, MYSQL* conn)
     {
             //发送重名空包
             tlv_t* t = tlv_create(ERR_NAME_CONFLICT, NULL, 0);
-            tlv_send(sock_fd, t);
+            tlv_send(net_fd, t);
             tlv_free(t);
             return 1;
     }
@@ -1623,7 +1661,7 @@ int usr_register(server_context_t* ctx,tlv_t *tlv, int net_fd, MYSQL* conn)
         //不重名发送盐值
         salt_maker(salt);
         tlv_t* t = tlv_create(AUTH_SALT,salt , strlen(salt)+1);
-        tlv_send(sock_fd, t);
+        tlv_send(net_fd, t);
         tlv_free(t);
     }
 
@@ -1637,18 +1675,19 @@ int usr_register(server_context_t* ctx,tlv_t *tlv, int net_fd, MYSQL* conn)
     if (AUTH_REGISTER != t->type || t->len == 0)return 1;
     memcpy(crptpswd, t->value, t->len);
     tlv_free(t);
+    t=NULL;
     //插入数据库
     vf_default_insert(conn, usr_name);
 
     //注册成功，返回token
     token_maker(SERVER_SECRET_KEY, usr_name, token, sizeof(token));
-    tlv_t* t = tlv_create(AUTH_TOKEN, token, strlen(token) + 1);
-    tlv_send(sock_fd, t);
+    t = tlv_create(AUTH_TOKEN, token, strlen(token) + 1);
+    tlv_send(net_fd, t);
     tlv_free(t);
 
 
     //更新session
-    session_init(ctx,conn,usr_name,net_fd);
+    session_insert(ctx,conn,usr_name,net_fd);
     //注册信息写入log
     log_connection(net_fd);
 
@@ -1659,7 +1698,7 @@ int usr_login(server_context_t* ctx,tlv_t* tlv, int net_fd, MYSQL* conn)
 
     char usr_name[512] = { 0 };
     char crptpswd[512] = { 0 };
-    char salt[SATL_LEN];
+    char salt[SALT_LEN];
     char token[512] = { 0 };
 
 
@@ -1669,16 +1708,16 @@ int usr_login(server_context_t* ctx,tlv_t* tlv, int net_fd, MYSQL* conn)
     if (ui_exist_user_name(conn, usr_name))
     {
         //用户存在，查sql获得盐值和密文密码保存，发送盐值
-        ui_get_salt_encrypt(conn, usr_name, salt, SATL_LEN, crptpswd, sizeof(crptpswd));
+        ui_get_salt_encrypt(conn, usr_name, salt, SALT_LEN, crptpswd, sizeof(crptpswd));
         tlv_t* t = tlv_create(AUTH_SALT, salt, strlen(salt) + 1);
-        tlv_send(sock_fd, t);
+        tlv_send(net_fd, t);
         tlv_free(t);
     }
     else
     {
         //发送用户不存在空包
         tlv_t* t = tlv_create(ERR_USER_NOT_FOUND, NULL, 0);
-        tlv_send(sock_fd, t);
+        tlv_send(net_fd, t);
         tlv_free(t);
         return 1;
     }
@@ -1696,29 +1735,29 @@ int usr_login(server_context_t* ctx,tlv_t* tlv, int net_fd, MYSQL* conn)
         return 1;
     }
     char temp[512] = { 0 };
-    memcpy(tmep, t->value, t->len);
+    memcpy(temp, t->value, t->len);
     tlv_free(t);
-
+    t=NULL;
     //密码正确，返回token
     if (strcmp(temp, crptpswd) == 0)
     {
 
         token_maker(SERVER_SECRET_KEY, usr_name, token, sizeof(token));
-        tlv_t* t = tlv_create(AUTH_TOKEN, token, strlen(token)+1);
-        tlv_send(sock_fd, t);
+        t = tlv_create(AUTH_TOKEN, token, strlen(token)+1);
+        tlv_send(net_fd, t);
         tlv_free(t);
     }
     else//密码错误，返回错误空包
     {
         //发送用户不存在空包
-        tlv_t* t = tlv_create(ERR_PASSWORD_INVALID, NULL, 0);
-        tlv_send(sock_fd, t);
+        t = tlv_create(ERR_PASSWORD_INVALID, NULL, 0);
+        tlv_send(net_fd, t);
         tlv_free(t);
         return 1;
     }
 
     //更新session
-    session_init(ctx,conn,usr_name,net_fd);
+    session_insert(ctx,conn,usr_name,net_fd);
     //注册信息写入log
     log_connection(net_fd);
 
@@ -2231,3 +2270,97 @@ int sha256_calc_range(const char* filename, size_t offset, size_t len, char* out
 
     return 0;
 }
+
+
+//11. l8w8jwt
+int encode(char *key, char *usr_name, char *token)
+    {
+        char* jwt;
+        size_t jwt_length;
+
+        struct l8w8jwt_encoding_params params;
+        l8w8jwt_encoding_params_init(&params);
+
+        params.alg = L8W8JWT_ALG_HS512;
+
+        params.sub = usr_name;
+        // params.iss = "Black Mesa";
+        //params.aud = "Administrator";
+
+        params.iat = time(NULL);
+        params.exp = time(NULL) + 600; /* Set to expire after 10 minutes (600 seconds). */
+
+        params.secret_key = (unsigned char*)key;
+        params.secret_key_length = strlen(params.secret_key);
+
+        params.out = &jwt;
+        params.out_length = &jwt_length;
+
+        int r = l8w8jwt_encode(&params);
+
+        // printf("strlen(jwd) = %lu\n", strlen(jwt));
+        // printf("\n l8w8jwt example HS512 token: %s \n", r == L8W8JWT_SUCCESS ? jwt : " (encoding failure) ");
+        if(r != L8W8JWT_SUCCESS)
+        {
+            printf("encoding failure\n");
+            return EXIT_FAILURE;
+        }
+        strcpy(token, jwt);
+        /* Always free the output jwt string! */
+        l8w8jwt_free(jwt);
+
+        return 0;
+    }
+
+int decode(char *key, char *usr_name, char *token)
+    {
+        struct l8w8jwt_decoding_params params;
+        l8w8jwt_decoding_params_init(&params);
+
+        params.alg = L8W8JWT_ALG_HS512;
+
+        params.jwt = token;
+        params.jwt_length = strlen(token);    
+        params.verification_key = (unsigned char*)key;
+        params.verification_key_length = strlen(key);
+
+        /* 
+         * Not providing params.validate_iss_length makes it use strlen()
+         * Only do this when using properly NUL-terminated C-strings! 
+         */
+        // params.validate_iss = "Black Mesa"; 
+        params.validate_sub = usr_name;
+
+        /* Expiration validation set to false here only because the above example token is already expired! */
+        params.validate_exp = 1; 
+        params.exp_tolerance_seconds = 60;
+
+        params.validate_iat = 1;
+        params.iat_tolerance_seconds = 60;
+
+        enum l8w8jwt_validation_result validation_result;
+
+        int decode_result = l8w8jwt_decode(&params, &validation_result, NULL, NULL);
+
+        if (decode_result == L8W8JWT_SUCCESS && validation_result == L8W8JWT_VALID) 
+        {
+            printf("\n Example HS512 token validation successful! \n");
+        }
+        else
+        {
+            printf("\n Example HS512 token validation failed! \n");
+            return EXIT_FAILURE;
+        }
+    
+        /*
+         * decode_result describes whether decoding/parsing the token succeeded or failed;
+         * the output l8w8jwt_validation_result variable contains actual information about
+         * JWT signature verification status and claims validation (e.g. expiration check).
+         * 
+         * If you need the claims, pass an (ideally stack pre-allocated) array of struct l8w8jwt_claim
+         * instead of NULL,NULL into the cortonding l8w8jwt_decode() function parameters.
+         * If that array is heap-allocated, remember to free it yourself!
+         */
+
+        return 0;
+    }
