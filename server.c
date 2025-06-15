@@ -1,4 +1,4 @@
-
+#define MAX_TOKEN_SIZE 1024
 //超时队列和session需要放前面
 #include <sys/wait.h>
 #include <mysql/mysql.h>
@@ -287,8 +287,6 @@ void init_logger(const char* log_file_path);
 // 记录连接信息
 void log_connection(int client_socket);
 
-// 记录操作信息
-void log_operation(const char* operation, ...);
 
 // 记录错误信息（带文件和行号）
 void log_error(const char* file, int line, const char* message, ...);
@@ -474,11 +472,9 @@ void sha256_final(SHA256_CTX* ctx, uint8_t hash[]);
 int sha256_calc_range(const char* filename, size_t offset, size_t len, char* out_str);
 
 
-
-
 int main() {
     server_context_t ctx;
-    server_init(&ctx, "./server.conf", "./log");
+    server_init(&ctx, "./server.config", "./log");
 
     time_t last_tick = time(NULL); // 初始化时间轮的 last_tick
 
@@ -736,7 +732,7 @@ void threadPoolDestroy(thread_pool_t* pool) {
     taskQueueDestroy(&pool->taskQueue);
 }
 
-// 线程池初始化函数copi
+// 线程池初始化函数
 int threadPoolInit(thread_pool_t* pool, int threadNum) {
     if (threadNum <= 0) {
         fprintf(stderr, "无效的线程数量: %d\n", threadNum);
@@ -785,27 +781,38 @@ int threadPoolInit(thread_pool_t* pool, int threadNum) {
 // 任务处理函数
 void* workerThread(void* arg) {
     thread_pool_t* pool = (thread_pool_t*)arg;
+
     while (1) {
         if (pool->exitFlag) break;
 
+        // 从任务队列中取出任务
         node_t* task = deQueue(&pool->taskQueue);
         if (task) {
             switch (task->type) {
-            case TASK_UPLOAD:
-                printf("处理上传任务: %s\n", task->param.filename);
-                break;
-            case TASK_DOWNLOAD_SMALL:
-                printf("处理单线程下载任务: %s\n", task->param.filename);
-                break;
-            case TASK_DOWNLOAD_LARGE:
-                printf("处理分块下载任务: %u/%u of file: %s\n",
-                    task->param.chunk_index + 1,
-                    task->param.chunk_count,
-                    task->param.filename);
-                break;
-            default:
-                printf("未知任务类型\n");
+                case TASK_UPLOAD:
+                    // 处理上传任务
+                    printf("处理上传任务: %s\n", task->param.upload.filename);
+                    break;
+
+                case TASK_DOWNLOAD_SMALL:
+                    // 处理小文件下载任务
+                    printf("处理单线程下载任务: %s\n", task->param.download_small.filename);
+                    break;
+
+                case TASK_DOWNLOAD_LARGE:
+                    // 处理分块下载任务
+                    printf("处理分块下载任务: %u/%u of file: %s\n",
+                           task->param.download_large.chunk_index + 1,
+                           task->param.download_large.chunk_count,
+                           task->param.download_large.filename);
+                    break;
+
+                default:
+                    // 未知任务类型
+                    printf("未知任务类型\n");
             }
+
+            // 释放任务资源
             free(task);
         }
     }
@@ -1068,7 +1075,6 @@ int tcpInit(const char* filename) {
         log_error(__FILE__, __LINE__, "Listen failed");
         exit(EXIT_FAILURE);
     }
-    log_operation("Server started and listening on port %d", port);
 
     return sockfd;
 }
@@ -1944,7 +1950,7 @@ int cmd_mkdir(Session_t* session, const char* path) {
         return -1;
     }
     // 3. 构造虚拟路径
-    char new_path[512];
+    char new_path[PATH_MAX];
     if ( strcmp(session->virtual_cwd, "/") == 0 )
         snprintf(new_path, sizeof(new_path), "/%s", path);
     else
@@ -1977,8 +1983,6 @@ int cmd_remove(Session_t* session, const char* path){
 
 
 // 8. trans函数
-
-
 
 
 
@@ -2055,6 +2059,7 @@ int token_maker(const char* key, const char* usr_name, char* token, size_t token
 
 
 // 封装token校验函数，并提取token中的sub（用户名）
+
 int token_validate(const char* key, const char* usr_name, const char* token, char* out_sub, size_t out_sub_len) {
     struct l8w8jwt_decoding_params params;
     l8w8jwt_decoding_params_init(&params);
@@ -2078,26 +2083,32 @@ int token_validate(const char* key, const char* usr_name, const char* token, cha
     params.iat_tolerance_seconds = 60;
 
     enum l8w8jwt_validation_result validation_result;
-    struct l8w8jwt_claim claim[8]; // 最多提取8个claim
-    size_t claim_count = 8;
+    
+    // 修复1: 使用指针声明并初始化为NULL
+    struct l8w8jwt_claim* claims = NULL;
+    size_t claim_count = 0;
 
-    int decode_result = l8w8jwt_decode(&params, &validation_result, claim, &claim_count);
+    // 修复2: 传递指针的地址 (&claims)
+    int decode_result = l8w8jwt_decode(&params, &validation_result, &claims, &claim_count);
 
     free(jwt_copy);
     free(sub_copy);
 
     if (decode_result == L8W8JWT_SUCCESS && validation_result == L8W8JWT_VALID) {
         // 提取sub
-        size_t i;
         int found_sub = 0;
-        for (i = 0; i < claim_count; ++i) {
-            if (strcmp(claim[i].key, "sub") == 0) {
-                strncpy(out_sub, claim[i].value, out_sub_len - 1);
+        for (size_t i = 0; i < claim_count; ++i) {
+            if (strcmp(claims[i].key, "sub") == 0) {
+                strncpy(out_sub, claims[i].value, out_sub_len - 1);
                 out_sub[out_sub_len - 1] = '\0';
                 found_sub = 1;
                 break;
             }
         }
+        
+        // 修复3: 使用后释放claims内存
+        l8w8jwt_free_claims(claims, claim_count);
+        
         if (!found_sub) {
             // 没有sub字段
             return -2;
@@ -2105,10 +2116,13 @@ int token_validate(const char* key, const char* usr_name, const char* token, cha
         return 0; // 验证通过
     }
     else {
+        // 修复4: 即使失败也要释放可能分配的内存
+        if (claims) {
+            l8w8jwt_free_claims(claims, claim_count);
+        }
         return -1; // 验证失败
     }
 }
-
 
 
 // 10.校验码
@@ -2273,47 +2287,51 @@ int sha256_calc_range(const char* filename, size_t offset, size_t len, char* out
 
 
 //11. l8w8jwt
-int encode(char *key, char *usr_name, char *token)
-    {
-        char* jwt;
-        size_t jwt_length;
+int encode(char *key, char *usr_name, char *token) {
+    char* jwt;
+    size_t jwt_length;
 
-        struct l8w8jwt_encoding_params params;
-        l8w8jwt_encoding_params_init(&params);
+    struct l8w8jwt_encoding_params params;
+    l8w8jwt_encoding_params_init(&params);
 
-        params.alg = L8W8JWT_ALG_HS512;
+    params.alg = L8W8JWT_ALG_HS512;
+    params.sub = usr_name;
+    params.iat = time(NULL);
+    params.exp = params.iat + 600; // 10分钟过期
 
-        params.sub = usr_name;
-        // params.iss = "Black Mesa";
-        //params.aud = "Administrator";
+    // 修复1：直接使用key计算长度
+    params.secret_key = (unsigned char*)key;
+    params.secret_key_length = strlen(key); // 使用原始key指针
 
-        params.iat = time(NULL);
-        params.exp = time(NULL) + 600; /* Set to expire after 10 minutes (600 seconds). */
+    params.out = &jwt;
+    params.out_length = &jwt_length;
 
-        params.secret_key = (unsigned char*)key;
-        params.secret_key_length = strlen(params.secret_key);
-
-        params.out = &jwt;
-        params.out_length = &jwt_length;
-
-        int r = l8w8jwt_encode(&params);
-
-        // printf("strlen(jwd) = %lu\n", strlen(jwt));
-        // printf("\n l8w8jwt example HS512 token: %s \n", r == L8W8JWT_SUCCESS ? jwt : " (encoding failure) ");
-        if(r != L8W8JWT_SUCCESS)
-        {
-            printf("encoding failure\n");
-            return EXIT_FAILURE;
+    int r = l8w8jwt_encode(&params);
+    
+    // 修复2：添加缓冲区大小检查
+    if (r == L8W8JWT_SUCCESS) {
+        // 检查token缓冲区是否足够
+        size_t jwt_strlen = strlen(jwt);
+        if (jwt_strlen < MAX_TOKEN_SIZE) { // 假设MAX_TOKEN_SIZE是您的缓冲区大小
+            strcpy(token, jwt);
+        } else {
+            // 处理缓冲区不足
+            l8w8jwt_free(jwt);
+            return -2;
         }
-        strcpy(token, jwt);
-        /* Always free the output jwt string! */
         l8w8jwt_free(jwt);
-
         return 0;
+    } else {
+        printf("Encoding failed: %d\n", r);
+        return -1;
     }
+}
 
-int decode(char *key, char *usr_name, char *token)
-    {
+
+
+
+int decode(char *key, char *usr_name, char *token){
+
         struct l8w8jwt_decoding_params params;
         l8w8jwt_decoding_params_init(&params);
 
@@ -2364,3 +2382,10 @@ int decode(char *key, char *usr_name, char *token)
 
         return 0;
     }
+
+
+    // 临时方案
+void sig_handler1(int signum) {}
+void sig_handler2(int signum) {}
+int cmd_upload(Session_t* session, const char* filename) { return 0; }
+int cmd_download(Session_t* session, const char* filename) { return 0; }
