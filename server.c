@@ -1,7 +1,9 @@
 
 //超时队列和session需要放前面
+#include <sys/wait.h>
 #include <mysql/mysql.h>
 #include <limits.h>
+#include <string.h>
 //1.3超时队列
 #define TIME_SLICE 30      // 超时时间轮长度，比如30s
 #define MAX_FD 1024       // 支持的最大netfd/net_fd数（可按需调整）
@@ -49,6 +51,8 @@ typedef struct Session_s {
 #include <sys/epoll.h>
 #include <signal.h>
 #include <fcntl.h>
+#define WORKER_NUM 3
+
 
 // 任务类型枚举
 typedef enum {
@@ -103,6 +107,8 @@ typedef struct {
     int exitFlag;
 } thread_pool_t;
 
+int epoll_add(int epfd, int fd);
+int epoll_del(int epfd, int fd);
 
 
 void taskQueueInit(taskQueue_t* queue);
@@ -112,6 +118,7 @@ void* workerThread(void* arg);
 void threadPoolInit(thread_pool_t* pool, int threadNum);
 void threadPoolDestroy(thread_pool_t* pool);
 void handler(int sig);
+void close_fd_on_timeout(int fd);
 
 
 // 1. server_init
@@ -131,7 +138,6 @@ typedef struct {
     int session_cnt;
 
     //还有其他服务器需要的，后面都可以放在这里
-
 } server_context_t;
 
 
@@ -357,6 +363,8 @@ tlv_t* tlv_recv(int sockfd);
 // 5. handle
 void handle_trans(tlv_t* p);
 
+int handle_command(Session_t* session, tlv_t* tlv);
+
 
 
 // 6. usr
@@ -465,23 +473,24 @@ int main() {
     server_context_t ctx;
     server_init(&ctx, "./server.conf", "./log");
 
+    time_t last_tick = time(NULL); // 初始化时间轮的 last_tick
     while (1) {
         //====时间轮tick：每秒tick一次，批量处理超时===
         time_t now = time(NULL);
-        static time_t last_tick = 0; // 修正未定义的变量 last_tick
         if (now != last_tick) {
             last_tick = now;
             timeout_wheel_tick(&ctx.timeout_wheel, close_fd_on_timeout); // 修正超时轮引用
         }
 
-        struct epoll_event readyArr[WORKER_NUM + 4]; // 修正未定义的 readyArr
-        int readyNum = epoll_wait(ctx.epfd, readyArr, WORKER_NUM + 4, 100);
-        if (readyNum == 0) {
+        struct epoll_event ready_arr[WORKER_NUM + 4]; // 定义 epoll 事件数组
+        int ready_num = epoll_wait(ctx.epfd, ready_arr, WORKER_NUM + 4, 100);
+        if (ready_num == 0) {
             // 时间轮tick统一处理超时，无就绪也无所谓
             continue;
         }
-        for (int i = 0; i < readyNum; ++i) {
-            int fd = readyArr[i].data.fd;
+        for (int i = 0; i < ready_num; ++i) {
+            int fd = ready_arr[i].data.fd;
+            // 新连接处理
             if (fd == ctx.listen_fd) {
                 int netfd = accept(ctx.listen_fd, NULL, NULL);
                 ERROR_CHECK(netfd, -1, "accept");
@@ -491,17 +500,18 @@ int main() {
                 timeout_wheel_touch(&ctx.timeout_wheel, netfd);
 
             }
+            // 退出信号处理
             else if (fd == ctx.exitPipe[0]) {
-                //退出唤醒所有线程优雅退出
+                // 退出唤醒所有线程优雅退出
                 ctx.threadPool.exitFlag = 1;
                 pthread_cond_broadcast(&ctx.threadPool.taskQueue.cond);
                 for (int j = 0; j < ctx.threadPool.threadNum; ++j) {
-                    pthread_join(ctx.threadPool.threads[j], NULL); // 修正线程数组引用
+                    pthread_join(ctx.threadPool.threads[j], NULL);
                 }
                 pthread_exit(NULL);
             }
+            // 收到TLV包处理
             else {
-                // 只负责主线程命令和上传/下载分发
                 tlv_t* tlv = tlv_recv(fd);
                 if (!tlv) {
                     epoll_del(ctx.epfd, fd);
@@ -512,53 +522,66 @@ int main() {
                 // 每收到一次客户端请求包，都刷新fd的超时时间
                 timeout_wheel_touch(&ctx.timeout_wheel, fd);
 
+                // 上传/下载任务分发
                 if (tlv->type / 16 == 2) { // 上传/下载
+                    task_param_t task_param;
+                    memset(&task_param, 0, sizeof(task_param_t));
+                    task_param.upload.netfd = fd;
+
+                    // 这里需要重写的，需要根据导图的流程
+                    //strcpy(task_param.upload.filename, tlv->value); // 使用 TLV 数据
+
+
+                    
                     if (tlv->type == CMD_UPLOAD) {
-                        // 上传任务，启动一个线程
-                        pthread_t upload_thread;
-                        task_param_t task_param;
-                        task_param.upload.netfd = fd;
-                        strcpy(task_param.upload.filename, tlv->value); // 使用 TLV 数据
-                        pthread_create(&upload_thread, NULL, handle_upload, &task_param);
-                        pthread_detach(upload_thread);
+                        // 上传任务入队
+                        enQueue(&ctx.threadPool.taskQueue, TASK_UPLOAD, &task_param);
                     }
+                    //要返回一个meta让客户端知道是否多点下载
                     else if (tlv->type == CMD_DOWNLOAD) {
-                        size_t file_size = get_file_size(tlv->value); // 获取文件大小
-                        if (file_size <= 100 * 1024 * 1024) { // 小文件
-                            pthread_t download_thread;
-                            task_param_t task_param;
-                            task_param.download_small.netfd = fd;
-                            strcpy(task_param.download_small.filename, tlv->value);
-                            pthread_create(&download_thread, NULL, handle_download_small, &task_param);
-                            pthread_detach(download_thread);
+                        
+                        size_t file_size;// = get_file_size(tlv->value); // 获取文件大小
+                        
+                        if (file_size <= 100 * 1024 * 1024) { // 小文件下载
+                            enQueue(&ctx.threadPool.taskQueue, TASK_DOWNLOAD_SMALL, &task_param);
                         }
-                        else { // 大文件，按100MB分片
+                        
+
+                        //大的task传进来，让它分成小的
+                        else { // 大文件，按100MB分片下载
                             size_t offset = 0;
                             unsigned int chunk_index = 0;
+                            
+                            //计算总的分片数，向上取整，把不同的分片发给子线程
                             unsigned int chunk_count = (file_size + 100 * 1024 * 1024 - 1) / (100 * 1024 * 1024);
                             while (offset < file_size) {
+                                
+                                //！！！！！计算分片大小：务必好好检查！！！！！！！！！！
                                 size_t chunk_size = (file_size - offset > 100 * 1024 * 1024) ? 100 * 1024 * 1024 : file_size - offset;
-                                pthread_t download_thread;
-                                task_param_t task_param;
-                                task_param.download_large.netfd = fd;
-                                strcpy(task_param.download_large.filename, tlv->value);
-                                task_param.download_large.offset = offset;
-                                task_param.download_large.size = chunk_size;
-                                task_param.download_large.chunk_index = chunk_index;
-                                task_param.download_large.chunk_count = chunk_count;
-                                pthread_create(&download_thread, NULL, handle_download_large, &task_param);
-                                pthread_detach(download_thread);
+                                task_param_t chunk_param;
+                                memset(&chunk_param, 0, sizeof(chunk_param));
+
+                                chunk_param.download_large.netfd = fd;
+
+                                // 这里需要重写的，需要根据导图的流程
+                                
+                                // strcpy(chunk_param.download_large.filename, tlv->value);
+                                chunk_param.download_large.offset = offset;
+                                chunk_param.download_large.size = chunk_size;
+                                chunk_param.download_large.chunk_index = chunk_index;
+                                chunk_param.download_large.chunk_count = chunk_count;
+                                enQueue(&ctx.threadPool.taskQueue, TASK_DOWNLOAD_LARGE, &chunk_param);
                                 offset += chunk_size;
                                 chunk_index++;
                             }
                         }
                     }
-                    tlv_free(tlv); // 释放tlv资源
+                    tlv_free(tlv); // 释放TLV资源
                 }
+                // 其他命令
                 else {
-                    // 其它命令直接主线程分发
-                    handle_packet(&ctx.session[fd], tlv); // 修正 handle_packet 调用
-                    free(tlv);
+                    handle_command(&ctx.session[fd], tlv); // 主线程处理非上传/下载的命令
+                    tlv_free(tlv); // 修正释放TLV资源的方式
                 }
             }
         }
@@ -570,10 +593,8 @@ int main() {
 
 
 
-
 // 0.线程池
-
-// 任务队列初始化
+// 初始化任务队列
 void taskQueueInit(taskQueue_t* queue) {
     queue->pFront = queue->pRear = NULL;
     queue->queueSize = 0;
@@ -591,7 +612,8 @@ void enQueue(taskQueue_t* queue, task_type_t type, task_param_t* param) {
     pthread_mutex_lock(&queue->mutex);
     if (queue->queueSize == 0) {
         queue->pFront = queue->pRear = newNode;
-    } else {
+    }
+    else {
         queue->pRear->pNext = newNode;
         queue->pRear = newNode;
     }
@@ -616,35 +638,93 @@ node_t* deQueue(taskQueue_t* queue) {
     return frontNode;
 }
 
+// 销毁任务队列
+void taskQueueDestroy(taskQueue_t* queue) {
+    pthread_mutex_lock(&queue->mutex);
+    while (queue->queueSize > 0) {
+        node_t* node = deQueue(queue);
+        free(node);
+    }
+    pthread_mutex_unlock(&queue->mutex);
+    pthread_mutex_destroy(&queue->mutex);
+    pthread_cond_destroy(&queue->cond);
+}
+
 // 任务处理函数
 void* workerThread(void* arg) {
     thread_pool_t* pool = (thread_pool_t*)arg;
     while (1) {
-        if (pool->exitFlag) break;
+        if (pool->exitFlag) break; // 检查线程池退出标志
 
-        node_t* task = deQueue(&pool->taskQueue);
+        node_t* task = deQueue(&pool->taskQueue); // 从任务队列中取任务
         if (task) {
             switch (task->type) {
                 case TASK_UPLOAD:
                     printf("处理上传任务: %s\n", task->param.upload.filename);
+                    // 执行上传逻辑
                     break;
+
                 case TASK_DOWNLOAD_SMALL:
                     printf("处理单线程下载任务: %s\n", task->param.download_small.filename);
+                    // 执行小文件下载逻辑
                     break;
+
                 case TASK_DOWNLOAD_LARGE:
                     printf("处理分块下载任务: %u/%u of file: %s\n",
                            task->param.download_large.chunk_index + 1,
                            task->param.download_large.chunk_count,
                            task->param.download_large.filename);
+                    // 执行分块下载逻辑
                     break;
+
                 default:
-                    printf("未知类型\n");
+                    printf("未知任务类型\n");
             }
-            free(task);
+            free(task); // 释放任务节点内存
         }
     }
     return NULL;
 }
+
+// 初始化线程池
+int threadPoolInit(thread_pool_t* pool, int threadNum) {
+    if (threadNum <= 0) return -1;
+    pool->threadNum = threadNum;
+    pool->threads = (pthread_t*)malloc(threadNum * sizeof(pthread_t));
+    if (!pool->threads) {
+        perror("Failed to allocate threads");
+        return -1;
+    }
+    taskQueueInit(&pool->taskQueue);
+    pthread_mutex_init(&pool->mutex, NULL);
+    pthread_cond_init(&pool->cond, NULL);
+    pool->exitFlag = 0;
+
+    for (int i = 0; i < threadNum; ++i) {
+        if (pthread_create(&pool->threads[i], NULL, workerThread, pool) != 0) {
+            perror("Failed to create thread");
+            free(pool->threads);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+// 销毁线程池
+void threadPoolDestroy(thread_pool_t* pool) {
+    pthread_mutex_lock(&pool->taskQueue.mutex);
+    pool->exitFlag = 1;
+    pthread_cond_broadcast(&pool->taskQueue.cond);
+    pthread_mutex_unlock(&pool->taskQueue.mutex);
+
+    for (int i = 0; i < pool->threadNum; ++i) {
+        pthread_join(pool->threads[i], NULL);
+    }
+    free(pool->threads);
+    taskQueueDestroy(&pool->taskQueue);
+}
+
+
 
 // 线程池初始化
 void threadPoolInit(thread_pool_t* pool, int threadNum) {
@@ -679,7 +759,7 @@ void handler(int sig) {
 
 // 1. server_init函数
 //整个服务器初始化
-int server_init(server_context_t* ctx, const char* conf_path) {
+int server_init(server_context_t* ctx, const char* conf_path,const char* log_path) {
     
 
     // 0.日志系统优先
@@ -700,7 +780,7 @@ int server_init(server_context_t* ctx, const char* conf_path) {
 
     // 2. 线程池初始化（只用于上传/下载这样的长命令）
     threadPoolInit(&ctx->threadPool, WORKER_NUM);
-    makeWorker(&ctx->threadPool);
+
 
     // 3. TCP初始化
     ctx->listen_fd = tcpInit(conf_path);
@@ -735,7 +815,7 @@ int session_init(server_context_t* ctx,MYSQL* conn,const char* user_name,int net
 	ctx->session[ctx->session_cnt].netfd = netfd;
 	memcpy(ctx->session[ctx->session_cnt].user_name,user_name,strlen(user_name)+1);
 	memcpy(ctx->session[ctx->session_cnt].virtual_cwd,"/",2);
-	ctx->session[ctx->session_cnt].cwd_id = vf_get_id_by_path_user(conn, session->virtual_cwd, user_name);
+	ctx->session[ctx->session_cnt].cwd_id = vf_get_id_by_path_user(conn, ctx->session->virtual_cwd, user_name);
 	ctx->session[ctx->session_cnt].conn = conn;
 	++ctx->session_cnt;
 	return 0;
@@ -793,8 +873,6 @@ void session_release(Session_t* session){
 
 
 
-
-//1.1 线程池
 int epoll_add(int epfd, int fd){
     struct epoll_event event;
     event.events = EPOLLIN;
@@ -807,62 +885,8 @@ int epoll_del(int epfd, int fd){
     return 0;
 }
 
-// threadPool
-int threadPoolInit(thread_pool_t *pthreadPool,int workerNum){
-    tidArrInit(&pthreadPool->tidArr, workerNum);
-    taskQueueInit(&pthreadPool->taskQueue);
-    pthread_mutex_init(&pthreadPool->mutex, NULL);
-    pthread_cond_init(&pthreadPool->cond, NULL);
-    pthreadPool->exitFlag = 0;
-    return 0;
-}
 
-// tidArr
-int tidArrInit(tidArr_t * ptidArr, int workerNum){
-    ptidArr->workerNum = workerNum;
-    ptidArr->arr = (pthread_t *)malloc(workerNum * sizeof(pthread_t));
-    return 0;
-}
 
-// taskQueue
-int taskQueueInit(taskQueue_t *pqueue){
-    bzero(pqueue,sizeof(taskQueue_t));
-    return 0;
-}
-int enQueue(taskQueue_t *pqueue, int netfd){
-    node_t * pNew = (node_t *)calloc(1,sizeof(node_t));
-    pNew->netfd = netfd;
-
-    if(pqueue->queueSize == 0){
-        pqueue->pFront = pNew;
-        pqueue->pRear = pNew;
-    }
-    else{
-        pqueue->pRear->pNext = pNew;
-        pqueue->pRear = pNew;
-    }
-    ++pqueue->queueSize;
-    return 0;
-}
-int deQueue(taskQueue_t *pqueue){
-    node_t * pCur = pqueue->pFront;
-    pqueue->pFront = pCur->pNext;
-    if(pqueue->queueSize == 1){
-        pqueue->pRear = NULL;
-    }
-    free(pCur);
-    --pqueue->queueSize;
-    return 0;
-}
-int printQueue(taskQueue_t *pqueue){
-    node_t * pCur = pqueue->pFront;
-    while(pCur){
-        printf("%3d", pCur->netfd);
-        pCur = pCur->pNext;
-    }
-    printf("\n");
-    return 0;
-}
 
 // 1.2 tcpInit
 
@@ -964,6 +988,7 @@ int tcpInit(const char* filename) {
 
 //1.3 超时队列
 /**
+
  * 初始化超时轮结构体
  */
 void timeout_wheel_init(timeout_wheel_t* wheel) {
@@ -1046,6 +1071,15 @@ void timeout_wheel_tick(timeout_wheel_t* wheel, void (*on_timeout)(int netfd)) {
     // timer前进
     wheel->timer = (wheel->timer + 1) % TIME_SLICE;
 }
+
+void close_fd_on_timeout(int fd) {
+    // 关闭超时fd，移除epoll监听，做清理
+    epoll_del(epfd, fd);
+    close(fd);
+    // 其它资源释放（如session、内存等）
+
+}
+
 
 
 
@@ -1524,28 +1558,7 @@ tlv_t* tlv_recv(int sockfd) {
 
 // 5. handle函数
 
-void handle_packet(tlv_t *tlv){
-    switch (tlv->type/16) {
-    case 0:
-        handle_command(tlv);
-        break;
 
-    case 1:
-        handle_auth(tlv);
-        break;
-
-    case 2:
-        handle_transfile(tlv);
-        break;
-
-    case 3:
-        handle_response(tlv);
-        break;
-
-    default :
-        break;
-    }
-}
 
 
 int handle_command(Session_t* session, tlv_t* tlv){
@@ -1582,56 +1595,6 @@ int handle_command(Session_t* session, tlv_t* tlv){
     return 0;
 }
 
-void handle_auth(tlv_t *tlv){
-    switch(tlvp->type){
-    case AUTH_REGISTER: // 用户注册
-    case AUTH_LOGIN:    // 用户登录
-    case AUTH_LOGOUT:   // 用户登出
-    case AUTH_TOK:      // 发送token
-    case AUTH_TOK_REF:  // Token刷新
-    }
-}
-
-
-
-void handle_transfile(tlv_t *tlv){
-    switch(tlv->type){
-    case TRANS_META:       // 文件元数据
-    case TRANS_CHUNK_DATA: // 文件分块数据
-    case END_MARKER:       // 传输结束标志，空包
-    case TRANS_RESEND:     // 重传请求
-    case TRANS_STREAM_BEG: // 流式传输开始，空包
-    case STREAM_END:       // 流式传输结束，空包
-    }
-}
-
-void handle_response(tlv_t *tlv){
-    switch(tlv->type){
-    case SUCCESS_REGIS:         // 注册成功
-    case SUCCESS_LOGIN:         // 登录成功
-    case OPEN_DIR_FAILED:       // 目录不存在或不是目录
-    case CHANGE_DIR_SUCCESS:    // 切换目录成功
-    case MKDIR_DIR_FAILED:      // 创建目录失败
-    case MKDIR_DIR_SUCCESS:     // 创建目录成功
-    case REMOVE_DIR_FAILED:     // 删除目录失败
-    case REMOVE_DIR_SUCCESS:    // 删除目录成功
-    case UPLOAD_FILE_FAILED:    // 上传文件失败
-    case UPLOAD_FILE_SUCCESS:   // 上传文件成功
-    case DOWNLOAD_FILE_FAILED:  // 下载文件失败
-    case DOWNLOAD_FILE_SUCCESS: // 下载文件成功
-    }
-}
-
-void handle_error(tlv_t *tlv){
-    switch(tlv->type){
-    case ERR_AUTH_NAME_CONFLICT:    // 重名错误
-    case ERR_AUTH_PASSWORD_INVALID: // 密码错误
-    case ERR_AUTH_USER_NOT_FOUND:   // 未找到用户名
-    case ERR_FILE:                  // 文件操作错误
-    case ERR_NET:                   // 网络错误
-    case ERR_SER:                   // 服务端内部错误
-    }
-}
 
 
 
