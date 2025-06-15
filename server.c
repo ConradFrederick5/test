@@ -487,7 +487,7 @@ int main() {
         //==== 时间轮 tick：每秒 tick 一次，批量处理超时 ===
         time_t now = time(NULL);
         if (now != last_tick) {
-            printf("[时间轮] 执行tick检查 (间隔: %ld秒)\n", now - last_tick);
+            //printf("[时间轮] 执行tick检查 (间隔: %ld秒)\n", now - last_tick);
             last_tick = now;
             timeout_wheel_tick(&ctx.timeout_wheel, close_fd_on_timeout); 
         }
@@ -607,12 +607,12 @@ int main() {
                     if (tlv->type ==AUTH_REGISTER)
                     {
                         //每个用户一个独立连接
-                        usr_register(ctx,tlv,fd,ctx.session[ctx.hashmap[fd]].conn;);
+                        usr_register(&ctx,tlv,fd,ctx.conn);
                     }
                     else if(tlv->type ==AUTH_LOGIN)
                     {
                         //每个用户一个独立连接
-                        usr_login(ctx,tlv,fd,ctx.session[ctx.hashmap[fd]].conn;);
+                        usr_login(&ctx,tlv,fd,ctx.conn);
                     }
                     tlv_free(tlv);
                     printf("[认证处理] 完成 (FD=%d)\n", fd);
@@ -1442,16 +1442,26 @@ int ui_exist_user_name(MYSQL* conn,const char* user_name){
 // 用户表插入
 int ui_insert(MYSQL* conn, const char* user_name, const char* salt, const char* encrypt_pwd) {
     char query[512];
+    printf("[测试] 尝试插入用户：'%s'\n%s\n%s", user_name,salt,encrypt_pwd);
     snprintf(query, sizeof(query),
              "INSERT INTO user_info (user_name, salt, encrypt_pwd) VALUES ('%s', '%s', '%s')",
              user_name, salt, encrypt_pwd);
 
+    // 添加调试信息：显示即将插入的用户名
+    printf("[测试] 尝试插入用户：'%s'\n%s\n%s", user_name,salt,encrypt_pwd);
+    printf("[测试] 生成的SQL: %s\n", query); // 注意：生产环境应移除敏感SQL打印
+
     int ret = mysql_query(conn, query);
     if (ret != 0) {
-        fprintf(stderr, "mysql_query failed: %s\n", mysql_error(conn));
-        return 1; // 插入失败
+        // 添加中文错误信息
+        fprintf(stderr, "\n[错误] 用户 '%s' 插入失败!\n", user_name);
+        fprintf(stderr, "错误详情: %s\n", mysql_error(conn));
+        return 1;
     }
-    return 0; // 插入成功
+    
+    // 添加中文成功信息
+    printf("[成功] 用户 '%s' 插入成功!\n", user_name);
+    return 0;
 }
 
 // 根据用户名查salt值和密文密码
@@ -1659,37 +1669,45 @@ tlv_t* tlv_recv(int sockfd) {
 
 
 
-int handle_command(Session_t* session, tlv_t* tlv){
+int handle_command(Session_t* session, tlv_t* tlv) {
     uint8_t type = tlv->type;
-    char path[1024]={0};
-    if(tlv->len > 0){
-        memcpy(path,tlv->value,tlv->len);
+    char path[1024] = {0};
+    
+    if(tlv->len > 0) {
+        memcpy(path, tlv->value, tlv->len);
     }
-    switch(type){
+    
+    switch(type) {
     case CMD_SHORT_CD:
-        cmd_cd(session,NULL);
+        printf("[测试] 执行短路径CD命令\n"); // 添加中文测试打印
+        cmd_cd(session, NULL);
         break;
+        
     case CMD_LONG_CD:
-        cmd_cd(session,path);
+        printf("[测试] 执行长路径CD命令，路径: %s\n", path); // 添加中文测试打印
+        cmd_cd(session, path);
         break;
+        
     case CMD_SHORT_LS:
+        printf("[测试] 执行短列表LS命令\n"); // 添加中文测试打印
         cmd_ls(session);
         break;
+        
     case CMD_MKDIR:
-        cmd_mkdir(session,path);
+        printf("[测试] 执行创建目录命令，路径: %s\n", path); // 添加中文测试打印
+        cmd_mkdir(session, path);
         break;
+        
     case CMD_REMOVE:
-        cmd_remove(session,path);
+        printf("[测试] 执行删除命令，目标: %s\n", path); // 添加中文测试打印
+        cmd_remove(session, path);
         break;
-    case CMD_UPLOAD:
-        cmd_upload(session,path);
-        break;
-    case CMD_DOWNLOAD:
-        cmd_download(session,path);
-        break;
+        
     default:
+        printf("[测试] 收到未定义命令类型: %d\n", type); // 添加中文测试打印
         break;
     }
+    
     return 0;
 }
 
@@ -1699,132 +1717,188 @@ int handle_command(Session_t* session, tlv_t* tlv){
 
 // 6. usr函数
 
-//int user_id?传入结构体中空闲的结构体id
-int usr_register(server_context_t* ctx,tlv_t *tlv, int net_fd, MYSQL* conn)
+//int user_id?传入结构体中空闲的结构体idint 
+
+
+int usr_register(server_context_t* ctx, tlv_t *tlv, int net_fd, MYSQL* conn)
 {
-    char usr_name[512] = {0};
+    // char usr_name[512] = {0};
+    char *usr_name=(char*)calloc(512,sizeof(char));
     char crptpswd[512] = {0};
     char salt[SALT_LEN];
-    char token[512]= { 0 };
+    char token[512] = {0};
 
-    //查数据库验证重名
+    printf("[调试] 开始处理用户注册\n");
+
+    // 查数据库验证是否重名
     memcpy(usr_name, tlv->value, tlv->len);
-    if (ui_exist_user_name(conn,usr_name))
+    printf("[调试] 接收到用户名: %s\n", usr_name);
+
+
+
+    if (ui_exist_user_name(conn, usr_name))
     {
-            //发送重名空包
-            tlv_t* t = tlv_create(ERR_NAME_CONFLICT, NULL, 0);
-            tlv_send(net_fd, t);
-            tlv_free(t);
-            return 1;
+        // 发送重名空包
+        printf("[调试] 用户名已存在: %s\n", usr_name);
+        tlv_t* t = tlv_create(ERR_NAME_CONFLICT, NULL, 0);
+        tlv_send(net_fd, t);
+        tlv_free(t);
+        return 1;
     }
-    else {
-        //不重名发送盐值
+    else
+    {
+        // 不重名，生成盐值并发送
+        printf("[调试] 用户名可用: %s\n", usr_name);
+        
+        printf("0 - usr_name:%s\n",usr_name);
         salt_maker(salt);
-        tlv_t* t = tlv_create(AUTH_SALT,salt , strlen(salt)+1);
+        printf("[调试] 生成的盐值: %s\n", salt);
+        fflush(stdout);
+    printf("0.5 - usr_name:%s\n",usr_name);
+
+        tlv_t* t = tlv_create(AUTH_SALT, salt, strlen(salt) + 1);
+    printf("1 - usr_name:%s\n",usr_name);
+
         tlv_send(net_fd, t);
         tlv_free(t);
     }
 
-    //接收第二个包
-    tlv_t*  t = tlv_recv(net_fd);
+
+
+    printf("1.5 - usr_name:%s\n",usr_name);
+
+    // 接收第二个包
+    tlv_t* t = tlv_recv(net_fd);
 
     /*
     不正确的包直接退出
     用户名、salt和密文密码一起插入用户表usr_name、crptpswd、salt
     */
-    if (AUTH_REGISTER != t->type || t->len == 0)return 1;
-    memcpy(crptpswd, t->value, t->len);
-    tlv_free(t);
-    t=NULL;
-    //插入数据库
-    vf_default_insert(conn, usr_name);
+    if (AUTH_REGISTER != t->type || t->len == 0)
+    {
+        printf("[调试] 注册时接收到无效包或包长度为0\n");
+        return 1;
+    }
+    printf("2 - usr_name:%s\n",usr_name);
 
-    //注册成功，返回token
+    memcpy(crptpswd, t->value, t->len);
+    printf("[调试] 接收到加密密码: %s\n", crptpswd);
+    tlv_free(t);
+    t = NULL;
+    
+    printf("3 - usr_name:%s\n",usr_name);
+    // 插入数据库
+    printf("\n\n%s\n%s\n%s\n",usr_name,salt,crptpswd);
+
+     if (ui_insert(conn, usr_name,salt,crptpswd) != 0)
+    {
+        printf("[调试] 插入用户表失败: %s\n", usr_name);
+        return 1;
+    }
+
+    printf("%s\n%s\n%s\n",usr_name,salt,crptpswd);
+    
+    if (vf_default_insert(conn, usr_name) != 0)
+    {
+        printf("[调试] 插入用户默认文件目录失败: %s\n", usr_name);
+        return 1;
+    }
+   
+
+    // 注册成功，生成并返回token
     token_maker(SERVER_SECRET_KEY, usr_name, token, sizeof(token));
+    printf("[调试] 生成的令牌: %s\n", token);
     t = tlv_create(AUTH_TOKEN, token, strlen(token) + 1);
     tlv_send(net_fd, t);
     tlv_free(t);
 
-
-    //更新session
-    session_insert(ctx,conn,usr_name,net_fd);
-    //注册信息写入log
+    // 更新session
+    session_insert(ctx, conn, usr_name, net_fd);
+    // 注册信息写入日志
     log_connection(net_fd);
 
+    printf("[调试] 用户注册完成: %s\n", usr_name);
+    free(usr_name);
 }
 
-int usr_login(server_context_t* ctx,tlv_t* tlv, int net_fd, MYSQL* conn)
+int usr_login(server_context_t* ctx, tlv_t* tlv, int net_fd, MYSQL* conn)
 {
-
-    char usr_name[512] = { 0 };
-    char crptpswd[512] = { 0 };
+    char usr_name[512] = {0};
+    char crptpswd[512] = {0};
     char salt[SALT_LEN];
-    char token[512] = { 0 };
+    char token[512] = {0};
 
+    printf("[调试] 开始处理用户登录\n");
 
-
-    // 查数据库验证用户存在
+    // 查数据库验证用户是否存在
     memcpy(usr_name, tlv->value, tlv->len);
+    printf("[调试] 接收到用户名: %s\n", usr_name);
+
     if (ui_exist_user_name(conn, usr_name))
     {
-        //用户存在，查sql获得盐值和密文密码保存，发送盐值
+        // 用户存在，查询盐值和密文密码，发送盐值
+        printf("[调试] 用户名存在: %s\n", usr_name);
         ui_get_salt_encrypt(conn, usr_name, salt, SALT_LEN, crptpswd, sizeof(crptpswd));
+        printf("[调试] 查询到的盐值: %s，密文密码: %s\n", salt, crptpswd);
         tlv_t* t = tlv_create(AUTH_SALT, salt, strlen(salt) + 1);
         tlv_send(net_fd, t);
         tlv_free(t);
     }
     else
     {
-        //发送用户不存在空包
+        // 发送用户不存在空包
+        printf("[调试] 用户名不存在: %s\n", usr_name);
         tlv_t* t = tlv_create(ERR_USER_NOT_FOUND, NULL, 0);
         tlv_send(net_fd, t);
         tlv_free(t);
         return 1;
     }
 
-    //收包验证密码：和crptpswd对比
+    // 收包验证密码
     tlv_t* t = tlv_recv(net_fd);
 
     /*
     不正确的包返回错误并退出
-
     */
-
     if (AUTH_LOGIN != t->type || t->len == 0)
     {
+        printf("[调试] 登录时接收到无效包或包长度为0\n");
         return 1;
     }
-    char temp[512] = { 0 };
+    char temp[512] = {0};
     memcpy(temp, t->value, t->len);
+    printf("[调试] 接收到用户输入的密码: %s\n", temp);
     tlv_free(t);
-    t=NULL;
-    //密码正确，返回token
+    t = NULL;
+
+    // 验证密码，返回token或错误
     if (strcmp(temp, crptpswd) == 0)
     {
-
+        printf("[调试] 密码验证成功: %s\n", usr_name);
         token_maker(SERVER_SECRET_KEY, usr_name, token, sizeof(token));
-        t = tlv_create(AUTH_TOKEN, token, strlen(token)+1);
+        printf("[调试] 生成的令牌: %s\n", token);
+        t = tlv_create(AUTH_TOKEN, token, strlen(token) + 1);
         tlv_send(net_fd, t);
         tlv_free(t);
     }
-    else//密码错误，返回错误空包
+    else
     {
-        //发送用户不存在空包
+        printf("[调试] 密码验证失败: %s\n", usr_name);
         t = tlv_create(ERR_PASSWORD_INVALID, NULL, 0);
         tlv_send(net_fd, t);
         tlv_free(t);
         return 1;
     }
 
-    //更新session
-    session_insert(ctx,conn,usr_name,net_fd);
-    //注册信息写入log
+    // 更新session
+    session_insert(ctx, conn, usr_name, net_fd);
+    // 登录信息写入日志
     log_connection(net_fd);
+
+    printf("[调试] 用户登录完成: %s\n", usr_name);
 
     return 0;
 }
-
-
 // 7. cmd 函数
 // 路径规范化函数 
 int normalize_virtual_path(const char* cwd, const char* input, char* output, size_t outlen) {
@@ -1899,48 +1973,70 @@ int normalize_virtual_path(const char* cwd, const char* input, char* output, siz
     return 0;
 }
 
-// cd命令
+
 int cmd_cd(Session_t* session, const char* path) {
+    printf("[CD测试] 开始处理CD命令\n"); // 开始执行CD命令的测试打印
+    
     char abs_path[256];
-    //if(path == NULL || strlen(path) == 0){
-    //    // 跳转回用户初始目录
-    //    strncpy(session->virtual_cwd,session->root_path,sizeof(session->virtual_cwd)-1);
-    //    session->virtual_cwd[sizeof(session->virtual_cwd)-1] = '\0';
-    //    session->cwd_id = session->root_id;
-    //    printf("切换到用户根目录: %s\n", session->virtual_cwd);
-    //    return 0;
-    // }
-    if ( path == NULL || strlen(path) == 0 ) {
+    
+    // 处理空路径情况
+    if (path == NULL || strlen(path) == 0) {
+        printf("[CD测试] 路径为空，切换到用户根目录\n");
+        
         memset(session->virtual_cwd, 0, PATH_MAX);
         session->virtual_cwd[0] = '/';
-        session->cwd_id = vf_get_id_by_path_user(session->conn,session->virtual_cwd,session->user_name);
+        session->cwd_id = vf_get_id_by_path_user(session->conn, session->virtual_cwd, session->user_name);
+        
+        printf("[CD测试] 当前虚拟工作目录设置为: %s\n", session->virtual_cwd);
+        printf("[CD测试] 当前目录ID: %d\n", session->cwd_id);
+        
         cmd_ls(session);
+        
+        return 0;
     }
-    if ( normalize_virtual_path(session->virtual_cwd, path, abs_path, sizeof(abs_path)) != 0 ) {
-        //printf("路径规范化失败: %s\n", path);
+    
+    printf("[CD测试] 请求路径: %s\n", path);
+    printf("[CD测试] 当前工作目录: %s\n", session->virtual_cwd);
+    
+    // 规范化路径
+    if (normalize_virtual_path(session->virtual_cwd, path, abs_path, sizeof(abs_path))) {
+        printf("[CD测试] 路径规范化失败: %s -> %s\n", path, abs_path);
+        
         tlv_t* empty_tlv = tlv_create((uint8_t)INVALID_DIR, NULL, 0);
         tlv_send(session->netfd, empty_tlv);
         tlv_free(empty_tlv);
-
+        
         return -1;
     }
-
+    
+    printf("[CD测试] 规范化后绝对路径: %s\n", abs_path);
+    
+    // 检查路径是否存在
     int id = vf_get_id_by_path_user(session->conn, abs_path, session->user_name);
-    if ( id > 0 ) {
+    printf("[CD测试] 路径ID查询结果: %d\n", id);
+    
+    if (id > 0) {
+        // 路径存在，更新会话信息
         session->cwd_id = id;
         strncpy(session->virtual_cwd, abs_path, sizeof(session->virtual_cwd) - 1);
         session->virtual_cwd[sizeof(session->virtual_cwd) - 1] = 0;
+        
+        printf("[CD测试] 切换目录成功\n");
+        printf("[CD测试] 新工作目录: %s\n", session->virtual_cwd);
+        printf("[CD测试] 新目录ID: %d\n", session->cwd_id);
+        
         tlv_t* empty_tlv = tlv_create((uint8_t)CMD_SUCCESS, NULL, 0);
         tlv_send(session->netfd, empty_tlv);
         tlv_free(empty_tlv);
-        //printf("切换目录成功: %s\n", abs_path);
-    }
-    else {
+    } else {
+        // 路径不存在
+        printf("[CD测试] 目录不存在: %s\n", abs_path);
+        
         tlv_t* empty_tlv = tlv_create((uint8_t)INVALID_DIR, NULL, 0);
         tlv_send(session->netfd, empty_tlv);
         tlv_free(empty_tlv);
-        //printf("目录不存在: %s\n", abs_path);
     }
+    
     return 0;
 }
 
@@ -1951,23 +2047,40 @@ int cmd_ls(Session_t* session) {
     int target_id;
     char* user_name = session->user_name;
 
+    // 打印当前用户信息
+    printf("[测试] 用户 '%s' 执行ls命令\n", user_name);
+    
     // 1.处理路径，如果path为NULL或者空字符串，列出当前目录
-        target_id = session->cwd_id;
-        strncpy(abs_path, session->virtual_cwd, sizeof(abs_path) - 1);
-        abs_path[sizeof(abs_path) - 1] = '\0';
+    target_id = session->cwd_id;
+    strncpy(abs_path, session->virtual_cwd, sizeof(abs_path) - 1);
+    abs_path[sizeof(abs_path) - 1] = '\0';
+    
+    // 打印当前工作目录信息
+    printf("[测试] 当前虚拟路径: %s (目录ID: %d)\n", abs_path, target_id);
     
     int file_count = 0;     // 统计查询到的目录和文件数量
     VirtualFileInfo_t* infos = vf_list_by_parent_id(session->conn, target_id, session->user_name, &file_count);
+    
+    // 打印查询结果数量
+    printf("[测试] 查询到 %d 个文件/目录\n", file_count);
+    
     if ( file_count == 0 ) {
+        printf("[测试] 目录为空，发送空列表响应\n");
         tlv_t* empty_tlv = tlv_create((uint8_t)CMD_SUCCESS, NULL, 0);
         tlv_send(session->netfd, empty_tlv);
         tlv_free(empty_tlv);
-        //printf("该目录下无文件或子目录\n");
     }
     else {
-        printf("目录%s下文件和目录:\n", abs_path);
+        printf("[测试] 目录内容: (d=目录, f=文件)\n");
         file_name_arr[0] = '\0';
+        
         for ( int i = 0; i < file_count; i++ ) {
+            // 打印每个文件/目录的详细信息
+            printf("  [条目%d] 类型:%s 名称:%s \n", 
+                   i+1, 
+                   infos[i].file_type, 
+                   infos[i].file_name);
+            
             if ( strcmp(infos[i].file_type, "d") == 0 ) {
                 size_t curr_len = strlen(file_name_arr);
                 snprintf(file_name_arr+curr_len, sizeof(file_name_arr) - curr_len, "#%s", infos[i].file_name);
@@ -1978,12 +2091,18 @@ int cmd_ls(Session_t* session) {
             }
         }
         file_name_arr[strlen(file_name_arr)] = '\0';
+        
+        // 打印最终组装的响应字符串
+        printf("[测试] 组装响应字符串: %s\n", file_name_arr);
+        
         tlv_t* ls_tlv = tlv_create((uint8_t)CMD_SUCCESS, file_name_arr, strlen(file_name_arr)+1);
         tlv_send(session->netfd, ls_tlv);
         tlv_free(ls_tlv);
+        printf("[测试] 已发送列表响应 (长度:%zu)\n", strlen(file_name_arr));
     }
+    
     if ( infos )   free(infos);
-
+    printf("[测试] ls命令处理完成\n");
     return 0;
 }
 
@@ -2049,7 +2168,7 @@ int salt_maker(char *salt)
     salt[0] = '$';
     salt[1] = '6';
     salt[2] = '$';
-    for (i = 3; i < SALT_LEN; ++i)
+    for (i = 3; i < SALT_LEN-1; ++i)
     {
         flag = rand() % 3;
         switch (flag)
@@ -2065,7 +2184,7 @@ int salt_maker(char *salt)
             break;
         }
     }
-    salt[SALT_LEN] = '\0';
+    salt[SALT_LEN-1] = '\0';
     return 0;
 }
 
@@ -2439,7 +2558,11 @@ int decode(char *key, char *usr_name, char *token){
 
 
     // 临时方案
-void sig_handler1(int signum) {}
-void sig_handler2(int signum) {}
+void sig_handler1(int signum) {
+exit(0);
+}
+void sig_handler2(int signum) {
+exit(0);
+}
 int cmd_upload(Session_t* session, const char* filename) { return 0; }
 int cmd_download(Session_t* session, const char* filename) { return 0; }
