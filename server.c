@@ -303,51 +303,54 @@ typedef struct tlv_s {
     uint8_t  value[];   // 柔性数组
 } tlv_t;
 
+
 typedef enum {
-    // 命令类型: COMMAND (0x00-0x06)
-    CMD_SHORT_CD = 0x00,   // 短的cd,不带数据
-    CMD_SHORT_LS = 0x01,   // 短的ls,不带数据
-    CMD_LONG_CD = 0x02,    // 长的cd,携带路径
-    CMD_MKDIR = 0x03,      // 创建目录
-    CMD_REMOVE = 0x04,     // 删除文件
-    CMD_UPLOAD = 0x05,     // 上传
-    CMD_DOWNLOAD = 0x06,   // 下载
+    /*---- 命令类别 (COMMAND 0x0*) ----*/
+    CMD_SHORT_CD    = 0x00,   // 短的cd,不带数据
+    CMD_SHORT_LS    = 0x01,   // 短的ls,不带数据
+    CMD_LONG_CD     = 0x02,   // 长的cd,携带路径
+    CMD_MKDIR       = 0x03,   // 列出文件（注意：原表描述与名称不一致）
+    CMD_REMOVE      = 0x04,   // 删除文件
 
-    // 认证类型: AUTH (0x10-0x15)
-    AUTH_REGISTER = 0x10,  // 用户注册
-    AUTH_LOGIN = 0x11,     // 用户登录
-    AUTH_LOGOUT = 0x12,    // 用户登出
-    AUTH_TOKEN = 0x13,     // 发送token
-    AUTH_TOK_REF = 0x14,   // Token刷新
-    AUTH_SALT = 0x15,      // 盐值
+    /*---- 认证类别 (AUTH 0x1*) ----*/
+    AUTH_REGISTER   = 0x10,   // 用户注册
+    AUTH_LOGIN      = 0x11,   // 用户登录
+    AUTH_LOGOUT     = 0x12,   // 用户登出
+    AUTH_TOKEN      = 0x13,   // 发送token
+    AUTH_TOK_REF    = 0x14,   // Token刷新
+    AUTH_SALT       = 0x15,   // 盐值
 
-    // 文件传输类型: TRANS (0x20-0x27)
-    TRANS_META = 0x20,        // 文件元数据
-    TRANS_TOKEN = 0x21,       // 客户端TOKEN下载
-    TRANS_CHUNK = 0x22,       // 服务端分块包
-    TRANS_TO_CHECK_POINT = 0x23,  // 需要检查断点
-    TRANS_BREAKPOINT_OK = 0x24,   // 正确的断点
-    TRANS_BREAKPOINT_ERR = 0x25,  // 错误的断点
-    TRANS_ENABLE_UPLOAD = 0x26,   // 允许上传
-    TRANS_SMALL_DOWNLOAD = 0x27,  // 小文件下载
+    /*---- 文件传输类别 (TRANS 0x2*) ----*/
+    CMD_UPLOAD              = 0x20,  // 上传
+    CMD_DOWNLOAD            = 0x21,  // 下载
+    TRANS_META              = 0x22,  // 文件元数据
+    TRANS_TOKEN             = 0x23,  // 客户端TOKEN下载：子线程
+    TRANS_CHUNK             = 0x24,  // 服务端分块包
+    TRANS_TO_CHECK_POINT    = 0x25,  // 需要检查断点
+    TANS_BREAKPOINT_OK      = 0x26,  // 正确的断点
+    TANS_BREAKPOINT_ERR     = 0x27,  // 错误的断点
+    TANS_ENABLE_UPLOAD      = 0x28,  // 允许上传
+    TANS_SMALL_DOWNLOAD     = 0x29,  // 小文件下载：主线程
+    TANS_ENABLE             = 0x2F,  // 允许发送文件（调整为0x2F解决冲突）
 
-    // 响应类型: RESPONSE (0x30-0x39)
-    SUCCESS_REGIS = 0x30,     // 注册成功
-    SUCCESS_LOGIN = 0x31,     // 登录成功
-    INVALID_DIR = 0x32,       // cd失败，目录不合法
-    CMD_SUCCESS = 0x33,       // 命令成功
-    MKDIR_FAILED = 0x34,      // 创建目录失败
-    REMOVE_DIR_FAILED = 0x36, // 删除目录失败
-    RETRANS = 0x38,           // 重新传输
-    TRANS_SUCCESS = 0x39,     // 传输成功
+    /*---- 响应类别 (RESPONSE 0x3*) ----*/
+    SUCCESS_REGIS       = 0x30,  // 注册成功
+    SUCCESS_LOGIN       = 0x31,  // 登录成功
+    INVALID_DIR         = 0x32,  // cd失败，目录不合法
+    CMD_SUCCESS         = 0x33,  // 命令成功
+    MKDIR_FAILED        = 0x34,  // 创建目录失败
+    REMOVE_DIR_FAILED   = 0x36,  // 删除目录失败
+    RETRANS             = 0x38,  // 重新传输
+    TRANS_SUCCESS       = 0x39,  // 传输成功
 
-    // 错误类型: ERROR (0x40-0x45)
-    ERR_NAME_CONFLICT = 0x40,   // 重名错误
-    ERR_PASSWORD_INVALID = 0x41,// 密码错误
-    ERR_USER_NOT_FOUND = 0x42,  // 未找到用户名
-    ERR_TRANS_ARGS = 0x43,      // 传输参数错误
-    ERR_FILE = 0x44,            // 文件操作错误
-    ERR_NET = 0x45              // 网络错误
+    /*---- 错误类别 (ERROR 0x4*) ----*/
+    ERR_NAME_CONFLICT       = 0x40,  // 重名错误
+    ERR_PASSWORD_INVALID   = 0x41,  // 密码错误
+    ERR_USER_NOT_FOUND     = 0x42,  // 未找到用户名
+    ERR_TRANS_ARGS         = 0x43,  // 传输参数错误
+    ERR_FILE               = 0x44,  // 文件操作错误
+    ERR_NET                = 0x45,  // 网络错误
+    ERR_SER                = 0x46   // 服务端内部错误（新增）
 } tlvType;
 
 tlv_t* tlv_create(uint8_t type, const void* data, uint16_t len);
@@ -475,153 +478,157 @@ int sha256_calc_range(const char* filename, size_t offset, size_t len, char* out
 int main() {
     server_context_t ctx;
     server_init(&ctx, "./server.config", "./log");
+        
 
     time_t last_tick = time(NULL); // 初始化时间轮的 last_tick
+    printf("[主循环] 服务器启动完成，进入主事件循环\n");
 
     while (1) {
         //==== 时间轮 tick：每秒 tick 一次，批量处理超时 ===
         time_t now = time(NULL);
         if (now != last_tick) {
+            printf("[时间轮] 执行tick检查 (间隔: %ld秒)\n", now - last_tick);
             last_tick = now;
             timeout_wheel_tick(&ctx.timeout_wheel, close_fd_on_timeout); 
         }
 
         struct epoll_event ready_arr[WORKER_NUM + 4]; // 定义 epoll 事件数组
         int ready_num = epoll_wait(ctx.epfd, ready_arr, WORKER_NUM + 4, 100);
+        
         if (ready_num == 0) {
-            // 时间轮 tick 统一处理超时，无就绪也无所谓
             continue;
         }
-
-
-        
-
         for (int i = 0; i < ready_num; ++i) {
             int fd = ready_arr[i].data.fd;
+            printf("[事件处理] FD=%d 就绪 | ", fd);
+            
             // 新连接
             if (fd == ctx.listen_fd) {
-            int netfd = accept(ctx.listen_fd, NULL, NULL);
-            ERROR_CHECK(netfd, -1, "accept");
-
-            // 新连接加入监听和时间轮，开始计时
-            epoll_add(ctx.epfd, netfd);
-            timeout_wheel_touch(&ctx.timeout_wheel, netfd);
+                printf("类型: 新连接请求\n");
+                int netfd = accept(ctx.listen_fd, NULL, NULL);
+                if (netfd == -1) {
+                    perror("[错误] accept失败");
+                    continue;
+                }
+                
+                printf("[新连接] 接受客户端 FD=%d\n", netfd);
+                
+                // 新连接加入监听和时间轮，开始计时
+                epoll_add(ctx.epfd, netfd);
+                timeout_wheel_touch(&ctx.timeout_wheel, netfd);
+                printf("[新连接] FD=%d 已添加到epoll和时间轮\n", netfd);
             }
+
             // 退出信号处理
             else if (fd == ctx.exitPipe[0]) {
+                printf("类型: 退出信号\n");
+                printf("[退出处理] 接收到退出信号，开始清理资源...\n");
+                
                 // 退出唤醒所有线程优雅退出
                 ctx.threadPool.exitFlag = 1;
                 pthread_cond_broadcast(&ctx.threadPool.taskQueue.cond);
+                printf("[线程池] 已广播退出信号\n");
+                
                 for (int j = 0; j < ctx.threadPool.threadNum; ++j) {
                     pthread_join(ctx.threadPool.threads[j], NULL);
+                    printf("[线程池] 线程 %d 已回收\n", j);
                 }
+                
+                printf("[退出处理] 资源清理完成，子进程退出\n");
                 pthread_exit(NULL);
             }
-            // 收到 TLV 包处理
+
+
+            // 收到 TLV 包
             else {
-                tlv_t* tlv = tlv_recv(fd);
+                
+                printf("[数据处理] 开始接收TLV包 (FD=%d)\n", fd);
+                tlv_t * tlv = tlv_recv(fd);
+                
                 if (!tlv) {
+                    printf("[错误] TLV接收失败或连接关闭 (FD=%d)\n", fd);
                     // 关闭连接并清理资源
                     epoll_del(ctx.epfd, fd);
                     close(fd);
+                    printf("[连接关闭] FD=%d 已关闭\n", fd);
                     continue;
                 }
+                
+                printf("[数据处理] 收到TLV包: 类型=%d, 长度=%u (FD=%d)\n", 
+                       tlv->type, tlv->len, fd);
 
                 // 每收到一次客户端请求包，都刷新 fd 的超时时间
                 timeout_wheel_touch(&ctx.timeout_wheel, fd);
+                printf("[超时刷新] FD=%d 超时时间已更新\n", fd);
 
-                // ===== 处理 TOKEN 包 =====需要合并入/2里
-                if (tlv->type == TRANS_TOKEN) {
-                    // char usr_name[64], token[128], out_sub[256];
-                    // size_t out_sub_len = sizeof(out_sub);
+                
 
-                    // // 从 TLV 中解析用户名和 Token
-                    // parse_token_tlv(tlv, usr_name, sizeof(usr_name), token, sizeof(token));
-
-                    // // 校验 Token
-                    // if (token_validate("secret_key", usr_name, token, out_sub, out_sub_len) != 0) {
-                    //     fprintf(stderr, "Token 验证失败: fd=%d\n", fd);
-                    //     tlv_free(tlv);
-                    //     continue;
-                    // }
-
-                    // // Token 验证通过，解析分片信息并入队
-                    // chunk_info_t chunk_info;
-                    // parse_chunk_info_tlv(tlv, &chunk_info);
-
-                    // task_param_t task_param;
-                    // memset(&task_param, 0, sizeof(task_param));
-                    // task_param.download_large.netfd = fd;
-                    // strncpy(task_param.download_large.filename, chunk_info.filename, sizeof(task_param.download_large.filename));
-                    // task_param.download_large.offset = chunk_info.offset;
-                    // task_param.download_large.size = chunk_info.size;
-                    // task_param.download_large.chunk_index = chunk_info.chunk_index;
-                    // task_param.download_large.chunk_count = chunk_info.chunk_count;
-
-                    // // 将分片任务入队
-                    // enQueue(&ctx.threadPool.taskQueue, TASK_DOWNLOAD_LARGE, &task_param);
-
-                    // tlv_free(tlv);
-                    // continue;
-                }
-
-                // ===== 上传/下载任务分发 =====
+                // ======= 上传/下载任务分发 =======
                 if (tlv->type / 16 == 2) { // 上传/下载
-                    // task_param_t task_param;
-                    // memset(&task_param, 0, sizeof(task_param_t));
-                    // task_param.upload.netfd = fd;
+                    printf("[任务分发] 上传/下载任务 (类型=%d, FD=%d)\n", tlv->type, fd);
+                    // ===== 处理 TOKEN 包 =====
+                    
+                    if (tlv->type == TRANS_TOKEN) {
+                    printf("[TOKEN处理] 收到TOKEN包 (FD=%d)\n", fd);
+                    // 这里添加你的TOKEN处理逻辑
+                    
+                    
+                    // ...
+                    tlv_free(tlv);
+                    continue;
+                    }
 
-                    // if (tlv->type == CMD_UPLOAD) {
-                    //     // 上传任务入队
-                    //     enQueue(&ctx.threadPool.taskQueue, TASK_UPLOAD, &task_param);
-                    // }
-                    // else if (tlv->type == CMD_DOWNLOAD) {
-                    //     // 获取文件大小
-                    //     size_t file_size = get_file_size(tlv->value);
 
-                    //     //小文件返回允许下载，大文件返回信息让客户端创子线程带token来
+                    else if (tlv->type == CMD_UPLOAD) {
+                        printf("[上传任务] 入队 (FD=%d)\n", fd);
+                        // 检查路径合法吗？应该携带用户文件元数据，冲突返回参数错误tlv，不冲突返回允许上传tlv（考虑需要带什么数据吗
                         
-                    //     if (file_size <= 100 * 1024 * 1024) { // 小文件下载
-                    //         enQueue(&ctx.threadPool.taskQueue, TASK_DOWNLOAD_SMALL, &task_param);
-                    //     }
-                    //     else { // 大文件按分片下载
-                    //         size_t offset = 0;
-                    //         unsigned int chunk_index = 0;
-                    //         unsigned int chunk_count = (file_size + 100 * 1024 * 1024 - 1) / (100 * 1024 * 1024);
+                        //任务加入任务队列——开启任务和执行任务解耦：让主线程对短命令更快响应
+                        
 
-                    //         while (offset < file_size) {
-                    //             size_t chunk_size = (file_size - offset > 100 * 1024 * 1024) ? 100 * 1024 * 1024 : file_size - offset;
+                    }
+                    else if (tlv->type == CMD_DOWNLOAD) {
+                        printf("[下载任务] 入队 (FD=%d)\n", fd);
+                        //download包携带虚拟文件路径，查sql确认同目录下是否存在同名文件。可以下载就返回给客户让他预留好位置（ftruncate)
+                        // 这里客户端可能存在断点判断
 
-                    //             task_param_t chunk_param;
-                    //             memset(&chunk_param, 0, sizeof(chunk_param));
-                    //             chunk_param.download_large.netfd = fd;
-                    //             strncpy(chunk_param.download_large.filename, tlv->value, sizeof(chunk_param.download_large.filename));
-                    //             chunk_param.download_large.offset = offset;
-                    //             chunk_param.download_large.size = chunk_size;
-                    //             chunk_param.download_large.chunk_index = chunk_index;
-                    //             chunk_param.download_large.chunk_count = chunk_count;
-
-                    //             // 分片任务入队
-                    //             enQueue(&ctx.threadPool.taskQueue, TASK_DOWNLOAD_LARGE, &chunk_param);
-                    //             offset += chunk_size;
-                    //             chunk_index++;
-                    //         }
-                    //     }
-                    // }
-                    // tlv_free(tlv);
+                        //断点校验和传文件给客户端都放入
+                        
+                    }
+                    
+                    tlv_free(tlv);
                 }
+
+
+                //注册登录
+                else if(tlv->type / 16 == 1)
+                {
+                    printf("[认证处理]  (类型=%d, FD=%d)\n", tlv->type, fd);
+                    if (tlv->type ==AUTH_REGISTER)
+                    {
+                        //每个用户一个独立连接
+                        usr_register(ctx,tlv,fd,ctx.session[ctx.hashmap[fd]].conn;);
+                    }
+                    else if(tlv->type ==AUTH_LOGIN)
+                    {
+                        //每个用户一个独立连接
+                        usr_login(ctx,tlv,fd,ctx.session[ctx.hashmap[fd]].conn;);
+                    }
+                    tlv_free(tlv);
+                    printf("[认证处理] 完成 (FD=%d)\n", fd);
+                }
+                //用户命令
                 else {
-                    // 其他命令
+                    printf("[命令处理] 其他命令 (类型=%d, FD=%d)\n", tlv->type, fd);
                     handle_command(&ctx.session[fd], tlv);
                     tlv_free(tlv);
+                    printf("[命令处理] 完成 (FD=%d)\n", fd);
                 }
             }
         }
     }
     return 0;
 }
-
-
 
 // 0.线程池
 
@@ -830,76 +837,108 @@ void handler(int sig) {
 // 1. server_init函数
 
 int server_init(server_context_t* ctx, const char* conf_path, const char* log_path) {
+    printf("[初始化] 开始服务器初始化...\n");
+    
     // 1. 日志系统优先
+    printf("[初始化] 初始化日志系统，路径: %s\n", log_path);
     init_logger(log_path);
 
     // 2. 退出管道、信号
+    printf("[初始化] 创建退出管道...\n");
     if (pipe(ctx->exitPipe) == -1) {
-        perror("Failed to create pipe");
+        perror("创建管道失败");
         close_logger();
         return -1;
     }
+    printf("[初始化] 管道创建成功: [%d, %d]\n", ctx->exitPipe[0], ctx->exitPipe[1]);
 
-    if (fork() != 0) {
+    printf("[初始化] 创建子进程...\n");
+    pid_t pid = fork();
+    if (pid != 0) {
         // 父进程逻辑
+        printf("[父进程] PID=%d 启动，等待子进程\n", getpid());
         close(ctx->exitPipe[0]);
         signal(SIGUSR1, sig_handler1);
         signal(SIGINT, sig_handler1);
         wait(NULL); // 等待子进程退出
         close(ctx->exitPipe[1]);
         close_logger(); // 关闭日志系统
+        printf("[父进程] 子进程已退出，父进程即将退出\n");
         exit(0);
     }
 
     // 子进程逻辑
+    printf("[子进程] PID=%d 启动，开始服务器初始化\n", getpid());
     signal(SIGINT, sig_handler2);
     close(ctx->exitPipe[1]);
 
-    // 3. 线程池初始化（只用于上传/下载这样的长命令）
+    // 3. 线程池初始化
+    printf("[子进程] 初始化线程池，工作线程数: %d\n", WORKER_NUM);
     if (threadPoolInit(&ctx->threadPool, WORKER_NUM) != 0) {
-        fprintf(stderr, "Failed to initialize thread pool\n");
+        fprintf(stderr, "线程池初始化失败\n");
         close_logger();
         return -1;
     }
+    printf("[子进程] 线程池初始化成功\n");
 
     // 4. TCP初始化
+    printf("[子进程] 初始化TCP，配置文件: %s\n", conf_path);
     ctx->listen_fd = tcpInit(conf_path);
     if (ctx->listen_fd == -1) {
-        fprintf(stderr, "Failed to initialize TCP\n");
+        fprintf(stderr, "TCP初始化失败\n");
         close_logger();
         return -1;
     }
+    printf("[子进程] TCP初始化成功，监听fd: %d\n", ctx->listen_fd);
 
+    // 5. 创建epoll实例
+    printf("[子进程] 创建epoll实例...\n");
     ctx->epfd = epoll_create(1);
     if (ctx->epfd == -1) {
-        perror("Failed to create epoll");
+        perror("创建epoll失败");
         close_logger();
         return -1;
     }
+    printf("[子进程] epoll创建成功，fd: %d\n", ctx->epfd);
 
-    // 5. 任务队列初始化
+    // 6. 任务队列初始化
+    printf("[子进程] 初始化任务队列...\n");
     taskQueueInit(&ctx->threadPool.taskQueue);
+    printf("[子进程] 任务队列初始化完成\n");
 
-    // 6. 时间轮初始化
+    // 7. 时间轮初始化
+    printf("[子进程] 初始化超时时间轮...\n");
     timeout_wheel_init(&ctx->timeout_wheel);
+    printf("[子进程] 时间轮初始化完成\n");
 
-    // 7. epoll添加监听
+    // 8. epoll添加监听
+    printf("[子进程] 添加监听fd到epoll...\n");
     epoll_add(ctx->epfd, ctx->listen_fd);
     epoll_add(ctx->epfd, ctx->exitPipe[0]);
+    printf("[子进程] 监听fd添加完成\n");
 
-    // 8. 数据库连接
+    // 9. 数据库连接
+    printf("[子进程] 连接数据库...\n");
     ctx->conn = NULL;
     if (db_connect(&ctx->conn) != 0) {
-        fprintf(stderr, "Failed to connect to database\n");
+        fprintf(stderr, "数据库连接失败\n");
         close_logger();
         return -1;
     }
+    printf("[子进程] 数据库连接成功\n");
 
-    // 9. session清零
+    // 10. session清零
+    printf("[子进程] 初始化session结构...\n");
     memset(ctx->session, 0, sizeof(ctx->session));
     ctx->session_cnt = 0;
-    memset(ctx->hashmap,0,sizeof(ctx->session));
+    printf("[子进程] session数组大小: %zu 字节\n", sizeof(ctx->session));
+    
+    printf("[子进程] 初始化hashmap...\n");
+    memset(ctx->hashmap, 0, sizeof(ctx->hashmap));
+    printf("[子进程] hashmap大小: %zu 字节\n", sizeof(ctx->hashmap));
+    printf("[子进程] session和hashmap初始化完成\n");
 
+    printf("[子进程] 服务器初始化完成，准备接收连接\n");
     return 0; // 子进程返回，父进程不返回
 }
 
@@ -992,7 +1031,10 @@ int tcpInit(const char* filename) {
        host:localhost
    */
     FILE* fp = fopen(filename, "r");
-    ERROR_CHECK(fp, NULL, "fopen failed");
+    if (fp == NULL) {
+        perror("fopen failed");
+        return -1;
+    }
 
     char ip[16] = { 0 };
     char port[6] = { 0 };  // 端口最大65535（5位）+1
@@ -1010,6 +1052,10 @@ int tcpInit(const char* filename) {
         char* nl = strchr(p + 1, '\n');
         if (nl) *nl = '\0';
         strncpy(ip, p + 1, sizeof(ip) - 1);
+    } else {
+        fclose(fp);
+        fprintf(stderr, "Invalid IP format\n");
+        return -1;
     }
 
     // 解析Port行
@@ -1034,6 +1080,10 @@ int tcpInit(const char* filename) {
             fprintf(stderr, "Invalid port format\n");
             return -1;
         }
+    } else {
+        fclose(fp);
+        fprintf(stderr, "Invalid port format\n");
+        return -1;
     }
 
     // 解析Host行（虽未使用，但保留）
@@ -1047,15 +1097,16 @@ int tcpInit(const char* filename) {
 
     // 创建套接字
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if(sockfd == 0){
-        log_error(__FILE__, __LINE__, "Socket creation failed");
-        exit(EXIT_FAILURE);
+    if(sockfd <= 0){  // 修改判断条件
+        perror("Socket creation failed");
+        return -1;  // 改为返回错误
     }
 
     int flag = 1;
-    if(setsockopt(sockfd,SOL_SOCKET,SO_REUSEADDR,&flag,sizeof(flag))){
-        log_error(__FILE__, __LINE__, "Setsockopt failed");
-        exit(EXIT_FAILURE);
+    if(setsockopt(sockfd,SOL_SOCKET,SO_REUSEADDR,&flag,sizeof(flag)) != 0){
+        perror("Setsockopt failed");
+        close(sockfd);  // 关闭已创建的socket
+        return -1;  // 改为返回错误
     }
 
     // 配置地址
@@ -1068,12 +1119,15 @@ int tcpInit(const char* filename) {
     // 绑定并监听
     int ret = bind(sockfd,(struct sockaddr *)&addr,sizeof(addr));
     if(ret == -1){
-        log_error(__FILE__, __LINE__, "Bind failed");
-        exit(EXIT_FAILURE);
+        perror("Bind failed");
+        close(sockfd);  // 关闭已创建的socket
+        return -1;  // 改为返回错误
     }
-    if(listen(sockfd,50)<0){
-        log_error(__FILE__, __LINE__, "Listen failed");
-        exit(EXIT_FAILURE);
+    
+    if(listen(sockfd,50) < 0){
+        perror("Listen failed");
+        close(sockfd);  // 关闭已创建的socket
+        return -1;  // 改为返回错误
     }
 
     return sockfd;
